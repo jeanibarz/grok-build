@@ -629,7 +629,8 @@ pub struct RuntimeResolutionContext<'a> {
     pub remote_settings: Option<&'a crate::util::config::RemoteSettings>,
     pub cwd: Option<&'a std::path::Path>,
     pub is_headless: bool,
-    /// `Some(true)` = CLI explicitly enabled, `None` = defer to config/env/remote.
+    /// `Some(true)`/`Some(false)` = CLI explicitly enables/disables, `None` =
+    /// defer to config/env/remote.
     pub cli_subagents: Option<bool>,
     pub cli_web_search_model: Option<&'a str>,
     pub cli_session_summary_model: Option<&'a str>,
@@ -1411,7 +1412,7 @@ pub struct Config {
     /// CLI `--no-memory` flag. Stored for `ConfigReloader` hot-reload re-resolution.
     #[serde(skip)]
     pub cli_no_memory: bool,
-    /// Original CLI `--subagents` tri-state, preserved for re-resolution
+    /// Original CLI subagent tri-state, preserved for re-resolution
     /// when remote settings settings are refreshed on /new.
     #[serde(skip)]
     pub cli_subagents: Option<bool>,
@@ -1439,7 +1440,8 @@ pub struct Config {
     #[serde(skip)]
     pub cli_agent_overrides: CliAgentOverrides,
     /// Whether subagent (task tool) support is enabled. Enabled by default;
-    /// disabled only via `GROK_SUBAGENTS=0` or `[subagents] enabled = false`.
+    /// the CLI override, `GROK_SUBAGENTS=0`, or `[subagents] enabled = false`
+    /// can disable it.
     /// Not remotely gated.
     #[serde(skip)]
     pub subagents_enabled: bool,
@@ -1889,7 +1891,7 @@ impl Config {
     /// paths only read model/key fields and do not need this call.
     pub fn resolve_subagents(
         &mut self,
-        cli_flag: bool,
+        cli_flag: Option<bool>,
         raw_config: &toml::Value,
         cwd: Option<&std::path::Path>,
     ) {
@@ -1920,8 +1922,7 @@ impl Config {
         self.cli_subagents = ctx.cli_subagents;
         self.web_search_model_override = ctx.cli_web_search_model.map(|s| s.to_owned());
         self.session_summary_model_override = ctx.cli_session_summary_model.map(|s| s.to_owned());
-        let cli_flag = ctx.cli_subagents.unwrap_or(false);
-        self.resolve_subagents(cli_flag, ctx.raw_config, ctx.cwd);
+        self.resolve_subagents(ctx.cli_subagents, ctx.raw_config, ctx.cwd);
         let tools = crate::config::ToolsConfig::resolve(ctx.raw_config);
         self.respect_gitignore = match self.requirements.respect_gitignore.pinned() {
             Some(pinned) => pinned,
@@ -10235,6 +10236,29 @@ hooks = true
             storage_mode: None,
         });
         assert!(cfg.subagents_enabled);
+    }
+    #[test]
+    #[serial]
+    fn resolve_runtime_fields_cli_subagents_disable_override() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            cwd: None,
+            is_headless: true,
+            cli_subagents: Some(false),
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert!(!cfg.subagents_enabled);
     }
     #[test]
     #[serial]

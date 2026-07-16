@@ -1,7 +1,9 @@
 //! AgentBuilder — fluent construction API for building Agents.
 use crate::agent::Agent;
 use crate::compaction::CompactionPolicy;
-use crate::config::{AGENT_TASK_CLASSIFIER_RE, short_tool_name, tool_id_eq, tool_id_matches};
+use crate::config::{
+    short_tool_name, tool_config_id_eq, tool_id_eq, tool_id_matches, AGENT_TASK_CLASSIFIER_RE,
+};
 use crate::config::{AgentDefinition, BuiltinAgentName, PermissionMode, PromptMode};
 use crate::discovery::{SubagentEntry, SubagentSource};
 use crate::error::AgentBuildError;
@@ -851,19 +853,24 @@ impl AgentBuilder {
             );
         }
         if !definition.disallowed_tools.is_empty() {
-            let before: std::collections::HashSet<String> =
-                tool_config.tools.iter().map(|tc| tc.id.clone()).collect();
-            tool_config
-                .tools
-                .retain(|tc| !tool_id_matches(&definition.disallowed_tools, &tc.id));
-            let after: std::collections::HashSet<String> =
-                tool_config.tools.iter().map(|tc| tc.id.clone()).collect();
-            let removed: std::collections::HashSet<&String> = before.difference(&after).collect();
+            let before = tool_config.tools.clone();
+            tool_config.tools.retain(|tc| {
+                !definition
+                    .disallowed_tools
+                    .iter()
+                    .any(|d| tool_config_id_eq(d, tc))
+            });
+            let after: std::collections::HashSet<&str> =
+                tool_config.tools.iter().map(|tc| tc.id.as_str()).collect();
+            let removed: Vec<_> = before
+                .iter()
+                .filter(|tc| !after.contains(tc.id.as_str()))
+                .collect();
             for d in &definition.disallowed_tools {
                 if AGENT_TASK_CLASSIFIER_RE.is_match(d) {
                     continue;
                 }
-                let matched = removed.iter().any(|&id| tool_id_eq(d, id));
+                let matched = removed.iter().any(|tool| tool_config_id_eq(d, tool));
                 if !matched {
                     tracing::warn!(
                         agent = % definition.name, tool = % d,
@@ -937,7 +944,7 @@ impl AgentBuilder {
         }
         tool_config
             .tools
-            .retain(|tc| definition.session_tools_allowed(&tc.id));
+            .retain(|tc| definition.session_tool_config_allowed(tc));
         {
             let mut saw_directive = false;
             let types: Vec<String> = definition
@@ -1745,7 +1752,11 @@ mod tests {
         assert_eq!(applied.0.timeout_enabled, Some(false));
         assert_eq!(applied.0.timeout_secs, Some(5));
     }
-    async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
+    async fn build_with_tools_and_subagents(
+        tools: Vec<String>,
+        disallowed: Vec<String>,
+        subagents_enabled: bool,
+    ) -> crate::agent::Agent {
         use xai_grok_tools::computer::local::LocalTerminalBackend;
         use xai_grok_tools::notification::ToolNotificationHandle;
         let mut def = crate::config::AgentDefinition::default_grok_build();
@@ -1757,9 +1768,13 @@ mod tests {
             ToolNotificationHandle::noop(),
         )
         .from_definition(def)
+        .with_subagents_enabled(subagents_enabled)
         .build()
         .await
         .unwrap()
+    }
+    async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
+        build_with_tools_and_subagents(tools, disallowed, false).await
     }
     /// Build a default agent under a session allowlist + the agent's own
     /// allowlist, returning the effective (short) tool names.
@@ -1841,6 +1856,30 @@ mod tests {
             "session clamp must bind despite the step-4 full-toolset fallback: {names:?}"
         );
     }
+    #[tokio::test]
+    async fn session_client_task_name_denylist_strips_task_tool() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let mut def = crate::config::AgentDefinition::default_grok_build();
+        def.session_tools_denylist = Some(vec!["spawn_subagent".into()]);
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(def)
+        .with_subagents_enabled(true)
+        .build()
+        .await
+        .expect("session denylist test agent should build");
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert!(!names.contains(&"spawn_subagent".to_string()));
+    }
     #[test]
     fn session_tools_allowed_clamp() {
         let mut def = crate::config::AgentDefinition::general_purpose();
@@ -1850,6 +1889,13 @@ mod tests {
         assert!(!def.session_tools_allowed("grep"));
         def.session_tools_denylist = Some(vec!["read_file".into()]);
         assert!(!def.session_tools_allowed("read_file"));
+        def.session_tools_allowlist = None;
+        let task = xai_grok_tools::registry::types::ToolConfig::from(
+            &xai_grok_tools::implementations::grok_build::TaskTool,
+        )
+        .with_name("spawn_subagent");
+        def.session_tools_denylist = Some(vec!["spawn_subagent".into()]);
+        assert!(!def.session_tool_config_allowed(&task));
     }
     #[test]
     fn hosted_tool_gating() {
@@ -1960,6 +2006,27 @@ mod tests {
         assert_eq!(
             agent.definition().allowed_subagent_types,
             Some(vec!["worker".into()])
+        );
+    }
+    #[tokio::test]
+    async fn disallowed_client_task_name_strips_task_tool() {
+        let enabled = build_with_tools_and_subagents(vec![], vec![], true).await;
+        assert!(enabled
+            .tool_definitions()
+            .await
+            .iter()
+            .any(|d| d.function.name == "spawn_subagent"));
+        let agent =
+            build_with_tools_and_subagents(vec![], vec!["spawn_subagent".into()], true).await;
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"spawn_subagent".to_string()),
+            "client-facing task name must deny the task tool; got: {names:?}"
         );
     }
     /// Compat allowlist names (`Read`, `Bash`, `Grep`) map to their Grok
