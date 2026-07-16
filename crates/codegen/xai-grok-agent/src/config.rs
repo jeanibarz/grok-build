@@ -1229,6 +1229,20 @@ pub(crate) fn short_tool_name(id: &str) -> &str {
 pub(crate) fn tool_id_eq(entry: &str, id: &str) -> bool {
     entry == id || entry == short_tool_name(id)
 }
+/// Whether an allow/deny `entry` refers to a typed tool by its internal id or
+/// client-facing name. Untyped custom/MCP tools deliberately do not match by
+/// `name_override`, so an alias cannot broaden their deny semantics.
+pub(crate) fn tool_config_id_eq(
+    entry: &str,
+    tool: &xai_grok_tools::registry::types::ToolConfig,
+) -> bool {
+    tool_id_eq(entry, &tool.id)
+        || (tool.kind.is_some()
+            && tool
+                .name_override
+                .as_deref()
+                .is_some_and(|name| tool_id_eq(entry, name)))
+}
 /// Whether any `list` entry refers to tool `id`.
 pub(crate) fn tool_id_matches(list: &[String], id: &str) -> bool {
     list.iter().any(|e| tool_id_eq(e, id))
@@ -1341,6 +1355,21 @@ impl AgentDefinition {
         self.session_tools_allowlist
             .as_deref()
             .is_none_or(|a| tool_id_matches(a, id))
+    }
+    /// Whether a function tool passes the session-operator clamp. Typed tools
+    /// may be addressed by their internal id or client-facing name; untyped
+    /// custom/MCP tools remain id-only.
+    pub(crate) fn session_tool_config_allowed(&self, tool: &ToolConfig) -> bool {
+        if self
+            .session_tools_denylist
+            .as_deref()
+            .is_some_and(|d| d.iter().any(|entry| tool_config_id_eq(entry, tool)))
+        {
+            return false;
+        }
+        self.session_tools_allowlist
+            .as_deref()
+            .is_none_or(|a| a.iter().any(|entry| tool_config_id_eq(entry, tool)))
     }
     /// Whether a hosted/server-side tool `id` survives the agent's own
     /// `disallowed_tools`/`tools` and the session clamp. Hosted tools aren't in
@@ -1662,6 +1691,16 @@ mod tests {
         let explore = toolset_for_preset("explore").unwrap();
         assert!(explore.tools.len() < plan.tools.len());
         assert!(plan.tools.len() < gb.tools.len());
+    }
+    #[test]
+    fn client_name_alias_matches_typed_tools_but_not_mcp_tools() {
+        let task = xai_grok_tools::registry::types::ToolConfig::from(&grok_build::TaskTool)
+            .with_name("spawn_subagent");
+        assert!(tool_config_id_eq("spawn_subagent", &task));
+
+        let mcp = xai_grok_tools::registry::types::ToolConfig::from_id("server:task")
+            .with_name("spawn_subagent");
+        assert!(!tool_config_id_eq("spawn_subagent", &mcp));
     }
     fn grok_computer_exclusive_ids() -> Vec<String> {
         #[allow(unused_mut)]

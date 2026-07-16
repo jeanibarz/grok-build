@@ -975,7 +975,7 @@ fn with_grok_subagents<T>(value: &str, f: impl FnOnce() -> T) -> T {
 fn subagents_config_default_enabled() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
     });
 }
@@ -983,8 +983,19 @@ fn subagents_config_default_enabled() {
 fn subagents_config_cli_flag_enables() {
     without_grok_subagents(|| {
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(true, &config);
+        let sa = SubagentsConfig::resolve(Some(true), &config);
         assert!(sa.enabled);
+    });
+}
+#[test]
+fn subagents_config_cli_flag_disables_configured_subagents() {
+    without_grok_subagents(|| {
+        let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
+        let sa = SubagentsConfig::resolve(Some(false), &config);
+        assert!(
+            !sa.enabled,
+            "--no-subagents must override [subagents] enabled = true"
+        );
     });
 }
 #[test]
@@ -993,7 +1004,7 @@ fn subagents_config_env_var_enables() {
         "1",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config);
+            let sa = SubagentsConfig::resolve(None, &config);
             assert!(sa.enabled);
         },
     );
@@ -1005,7 +1016,7 @@ fn subagents_config_env_var_disables() {
         || {
             let config: toml::Value = toml::from_str("[subagents]\nenabled = true")
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config);
+            let sa = SubagentsConfig::resolve(None, &config);
             assert!(! sa.enabled, "GROK_SUBAGENTS=0 should override config file");
         },
     );
@@ -1014,7 +1025,7 @@ fn subagents_config_env_var_disables() {
 fn subagents_config_toml_enables() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
     });
 }
@@ -1023,7 +1034,7 @@ fn subagents_config_local_disabled_wins() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = false")
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(! sa.enabled, "local [subagents] enabled=false should win");
     });
 }
@@ -1033,7 +1044,7 @@ fn subagents_config_env_var_disables_default() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(false, &config);
+            let sa = SubagentsConfig::resolve(None, &config);
             assert!(
                 ! sa.enabled, "GROK_SUBAGENTS=0 should override the enabled default"
             );
@@ -1050,7 +1061,7 @@ fn subagents_config_remote_settings_key_is_ignored() {
             )
             .expect("unknown subagents_enabled key must not break parsing");
         let config = toml::Value::Table(toml::map::Map::new());
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
     });
 }
@@ -1060,7 +1071,7 @@ fn subagents_config_cli_flag_overrides_env_var() {
         "0",
         || {
             let config = toml::Value::Table(toml::map::Map::new());
-            let sa = SubagentsConfig::resolve(true, &config);
+            let sa = SubagentsConfig::resolve(Some(true), &config);
             assert!(sa.enabled, "--subagents CLI flag should override GROK_SUBAGENTS=0");
         },
     );
@@ -1079,7 +1090,7 @@ fn subagents_config_models_parsed() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
         assert_eq!(sa.models.len(), 2);
         assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
@@ -1090,7 +1101,7 @@ fn subagents_config_models_parsed() {
 fn subagents_config_models_empty_when_missing() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
         assert!(sa.models.is_empty());
     });
@@ -1105,7 +1116,7 @@ fn subagents_config_models_without_enabled() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(
             ! sa.enabled, "explicit [subagents] section without enabled should be false"
         );
@@ -1125,7 +1136,7 @@ fn subagents_config_models_with_env_var_enables() {
                 "#,
                 )
                 .unwrap();
-            let sa = SubagentsConfig::resolve(false, &config);
+            let sa = SubagentsConfig::resolve(None, &config);
             assert!(sa.enabled, "GROK_SUBAGENTS=1 should enable");
             assert_eq!(sa.models.get("explore").unwrap(), "grok-3-fast");
         },
@@ -1147,7 +1158,7 @@ fn subagents_config_toggle_mixed_values() {
                 "#,
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
         assert_eq!(sa.toggle.len(), 4);
         assert_eq!(sa.toggle.get("explore").copied(), Some(true));
@@ -1160,7 +1171,7 @@ fn subagents_config_toggle_mixed_values() {
 fn subagents_config_toggle_missing_defaults_to_empty() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(None, &config);
         assert!(sa.enabled);
         assert!(
             sa.toggle.is_empty(),
@@ -2310,8 +2321,7 @@ fn project_overlay_preserves_source_precedence() {
             "#,
         )
         .unwrap();
-    let base = SubagentsConfig::resolve_base_with_sources(
-        false,
+    let base = SubagentsConfig::resolve_base_with_sources(None,
         &config,
         Some(&home.join(".grok")),
         &bundled,
@@ -2427,8 +2437,7 @@ fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
             "#,
         )
         .unwrap();
-    let base = SubagentsConfig::resolve_base_with_sources(
-        true,
+    let base = SubagentsConfig::resolve_base_with_sources(Some(true),
         &config,
         Some(&home.join(".grok")),
         &bundled,
@@ -2458,8 +2467,7 @@ fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
             enabled = true
             "#)
         .unwrap();
-    let base = SubagentsConfig::resolve_base_with_sources(
-        true,
+    let base = SubagentsConfig::resolve_base_with_sources(Some(true),
         &config,
         Some(&home.join(".grok")),
         &bundled,
@@ -2489,8 +2497,7 @@ fn bundled_personas_and_roles_have_lowest_priority_in_resolve_order() {
             enabled = true
             "#)
         .unwrap();
-    let base = SubagentsConfig::resolve_base_with_sources(
-        true,
+    let base = SubagentsConfig::resolve_base_with_sources(Some(true),
         &config,
         Some(&home.join(".grok")),
         &bundled,
@@ -3170,8 +3177,7 @@ fn project_overlay_tracks_authoritative_trust_transitions() {
 fn base_resolver_without_project_cwd_keeps_project_files_out() {
     let tmp = tempfile::tempdir().unwrap();
     write_subagent_definitions(&tmp.path().join(".grok"), &[("project", "Project")]);
-    let base = SubagentsConfig::resolve_base_with_sources(
-        false,
+    let base = SubagentsConfig::resolve_base_with_sources(None,
         &toml::Value::Table(Default::default()),
         None,
         &tmp.path().join("bundled"),
@@ -3186,8 +3192,7 @@ fn explicit_grok_root_is_the_only_user_source() {
     let configured = tmp.path().join("configured-grok-home");
     write_subagent_definitions(&ambient, &[("ambient", "Ambient")]);
     write_subagent_definitions(&configured, &[("configured", "Configured")]);
-    let base = SubagentsConfig::resolve_base_with_sources(
-        false,
+    let base = SubagentsConfig::resolve_base_with_sources(None,
         &toml::Value::Table(Default::default()),
         Some(&configured),
         &configured.join("bundled"),

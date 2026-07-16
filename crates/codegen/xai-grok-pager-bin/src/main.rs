@@ -1971,6 +1971,7 @@ async fn async_main() -> Result<()> {
                 resume: args.resume_session.or(args.load_session),
                 cwd: args.cwd,
                 yolo: launch_yolo.yolo,
+                no_subagents: args.no_subagents,
                 trust: args.trust,
                 output_format: args.output_format,
                 json_schema,

@@ -709,8 +709,7 @@ mod tests {
             "description = \"project role\"\n",
         )
         .unwrap();
-        let base = crate::config::SubagentsConfig::resolve_base_with_sources(
-            false,
+        let base = crate::config::SubagentsConfig::resolve_base_with_sources(None,
             &toml::Value::Table(Default::default()),
             None,
             &root,

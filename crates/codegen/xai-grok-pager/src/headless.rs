@@ -182,6 +182,8 @@ pub struct HeadlessOptions {
     pub resume: Option<String>,
     pub cwd: Option<PathBuf>,
     pub yolo: bool,
+    /// Whether the CLI explicitly disables subagent spawning.
+    pub no_subagents: bool,
     pub trust: bool,
     pub output_format: OutputFormat,
     pub json_schema: Option<serde_json::Value>,
@@ -895,7 +897,9 @@ pub async fn run_single_turn(
         raw_config: &raw_config,
         remote_settings: None,
         is_headless: true,
-        cli_subagents: None,
+        // Keep the CLI override tri-state: an absent --no-subagents flag must
+        // still allow GROK_SUBAGENTS/config.toml to decide the default.
+        cli_subagents: options.no_subagents.then_some(false),
         cli_web_search_model: None,
         cli_session_summary_model: None,
         cli_experimental_memory: false,
