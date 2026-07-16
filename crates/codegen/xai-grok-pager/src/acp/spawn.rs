@@ -14,7 +14,10 @@ use xai_acp_lib::{
     acp_channels,
 };
 use xai_grok_shell::{
-    agent::{MvpAgent, config::Config as AgentConfig, models::RefreshStrategy},
+    agent::{
+        MvpAgent, activity::AgentActivity, config::Config as AgentConfig,
+        models::RefreshStrategy,
+    },
     auth::AuthManager,
     util::grok_home::grok_home,
 };
@@ -28,6 +31,12 @@ pub struct SpawnedAgent {
     /// The agent's `AuthManager`, shared so pager-side consumers (e.g. the voice
     /// channel) resolve the same refreshing bearer as chat traffic.
     pub auth_manager: std::sync::Arc<AuthManager>,
+    /// The agent's `Send + Sync` activity view (same instance the session
+    /// actors register into). Lets the headless shutdown path call
+    /// [`AgentActivity::flush_all_sessions`] to end the parent session actor
+    /// gracefully — emitting `session_end` — before `cancel.cancel()` drops
+    /// the agent's `LocalSet` and aborts the actor. See issue #1.
+    pub activity: AgentActivity,
 }
 
 /// Spawn a GrokShell agent in a background thread.
@@ -72,12 +81,21 @@ pub async fn spawn_grok_shell(
     // pager (voice channel) can share the same refreshing bearer.
     let auth_manager_for_pager = auth_manager.clone();
 
+    // Shared activity view: one instance installed on the agent (so its session
+    // actors register into it) and cloned onto `SpawnedAgent` so the pager's
+    // shutdown path can flush sessions gracefully. See issue #1.
+    let activity = AgentActivity::default();
+    let activity_for_agent = activity.clone();
+
     let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<Rc<MvpAgent>> + Send + 'static> = {
         Box::new(move |client_tx| {
             let gateway = AcpGatewaySender::new(client_tx);
 
             let mut agent =
                 MvpAgent::with_models(gateway, &agent_config, auth_manager, models_manager);
+            // Must be installed right after construction, before any session is
+            // created, so session actors register into this shared instance.
+            agent.set_activity(activity_for_agent);
             if let Some(mc) = memory_config {
                 agent.set_memory_config(mc);
             }
@@ -93,6 +111,7 @@ pub async fn spawn_grok_shell(
         channel: acp_client,
         cancel: agent_cancel,
         auth_manager: auth_manager_for_pager,
+        activity,
     })
 }
 

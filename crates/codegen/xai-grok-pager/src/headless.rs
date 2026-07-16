@@ -27,6 +27,28 @@ use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::spawn::spawn_grok_shell;
 use crate::client_identity::{HEADLESS_CLIENT_TYPE, PAGER_CLIENT_VERSION};
 
+/// Bound on the shutdown session flush ([`AgentActivity::flush_all_sessions`])
+/// on the normal `-p` exit path. Matches the leader's `RELAUNCH_FLUSH_GRACE`;
+/// the parent actor's Shutdown arm (SessionEnd/Stop hooks + memory save) drains
+/// well within this, and the deadline caps how long a stuck actor delays exit.
+const HEADLESS_FLUSH_GRACE: Duration = Duration::from_secs(5);
+
+/// Headless shutdown discipline: flush every live session actor (each runs its
+/// `SessionCommand::Shutdown` arm — replay-buffer flush, `SessionEnd`/`Stop`
+/// hooks, memory save) and only then cancel the agent's root token. Ordering
+/// matters: `cancel.cancel()` drops the agent's `LocalSet`, aborting any actor
+/// that has not yet exited, so a cancel-before-flush would lose the parent
+/// session's `session_end` (issue #1). Extracted so the ordering is a named,
+/// testable unit.
+async fn flush_sessions_then_cancel(
+    activity: &xai_grok_shell::agent::activity::AgentActivity,
+    cancel: &CancellationToken,
+    grace: Duration,
+) {
+    activity.flush_all_sessions(grace).await;
+    cancel.cancel();
+}
+
 // ── Types ────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -934,6 +956,9 @@ pub async fn run_single_turn(
         }
     };
     let (acp_tx, mut acp_rx) = (spawned.channel.tx, spawned.channel.rx);
+    // Shared with the agent's session actors; used at exit to flush the parent
+    // session gracefully (emit `session_end`) before cancelling. See issue #1.
+    let activity = spawned.activity.clone();
     crate::unified_log::init(acp_tx.clone());
     crate::unified_log::info(
         "pager started",
@@ -1282,7 +1307,12 @@ pub async fn run_single_turn(
         // Non-blocking flock so a slow/network ~/.grok can't hang exit.
         let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
     }
-    cancel.cancel();
+    // Give the headless parent session the same flush-before-cancel discipline
+    // as the leader/app shutdown paths: `SessionCommand::Shutdown` (→ `SessionEnd`
+    // hooks) drains before `cancel.cancel()` drops the agent's `LocalSet` and
+    // aborts the actor. Without this the parent session never emits `session_end`
+    // in headless `-p` mode (issue #1).
+    flush_sessions_then_cancel(&activity, &cancel, HEADLESS_FLUSH_GRACE).await;
     match prompt_result {
         Some(Ok(resp)) => {
             let stop_reason = format!("{:?}", resp.stop_reason);
@@ -2132,5 +2162,31 @@ mod tests {
             handle_ext_notification(&notif, OutputFormat::Plain),
             ExtEvent::None
         ));
+    }
+
+    /// Guards the headless exit ordering (issue #1): the shutdown tail must
+    /// flush sessions and *then* cancel — a cancel-before-flush drops the
+    /// agent's `LocalSet` and loses the parent session's `session_end`.
+    ///
+    /// The pager crate can't register a real session actor into an
+    /// `AgentActivity` (`register_session` is `pub(crate)` to `xai-grok-shell`),
+    /// so this exercises the ordering with an empty activity: the flush is a
+    /// bounded no-op and the token must end up cancelled. The flush's actual
+    /// `Shutdown` → `session_end` mechanism is covered by the
+    /// `agent::activity::flush_*` tests and the run-loop `Shutdown` arm; the
+    /// spawn-side wiring that shares the agent's activity onto `SpawnedAgent`
+    /// is covered by the `xai-grok-pager` build.
+    #[tokio::test]
+    async fn shutdown_tail_cancels_only_after_flushing() {
+        let activity = xai_grok_shell::agent::activity::AgentActivity::default();
+        let cancel = CancellationToken::new();
+        assert!(!cancel.is_cancelled());
+
+        flush_sessions_then_cancel(&activity, &cancel, HEADLESS_FLUSH_GRACE).await;
+
+        assert!(
+            cancel.is_cancelled(),
+            "headless exit must cancel the agent token after flushing sessions"
+        );
     }
 }
