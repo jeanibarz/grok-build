@@ -958,12 +958,13 @@ impl SessionActor {
                             resolved_tool_name.clone(),
                             hook_name,
                             reason,
+                            raw_input.clone(),
                         )
                         .await?));
                 }
             }
             if let Some(denied) = self
-                .run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope)
+                .run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope, &raw_input)
                 .await?
             {
                 return Ok(Err(denied));

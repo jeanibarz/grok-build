@@ -242,7 +242,12 @@ async fn subagent_inherits_parent_pre_tool_use_client_hook() {
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                subagent.run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope),
+                subagent.run_pre_tool_use_client_hook(
+                    &call,
+                    &tool_call_id,
+                    &envelope,
+                    &serde_json::json!({}),
+                ),
             )
             .await
             .expect("the gate must not hang")
@@ -333,7 +338,12 @@ async fn pre_tool_use_slow_callback_does_not_starve_a_deny() {
             // pass proves the deny was not serialized behind the slow callback.
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.run_pre_tool_use_client_hook(&call, &tool_call_id, &envelope),
+                actor.run_pre_tool_use_client_hook(
+                    &call,
+                    &tool_call_id,
+                    &envelope,
+                    &serde_json::json!({}),
+                ),
             )
             .await
             .expect("a deny must resolve without waiting on the hung callback")
@@ -951,6 +961,120 @@ async fn alias_envelope_serializes_canonical_event_name() {
             assert_eq!(value["hookEventName"], "subagent_stop");
             // The test actor runs yolo, so permissionMode pins that state.
             assert_eq!(value["permissionMode"], "bypassPermissions");
+        })
+        .await;
+}
+
+/// A `PreToolUse` hook deny must ALSO fire the `PermissionDenied` lifecycle event, so
+/// subscribers see a terminal event for the blocked call (matching the permission-manager
+/// deny branch). Regression guard for the bug where the hook-deny path routed through
+/// `deny_tool` and emitted telemetry + a scrollback annotation but never dispatched
+/// `PermissionDenied`, leaving supervisors to infer the block from a `PreToolUse` with no
+/// matching terminal event.
+#[tokio::test(flavor = "current_thread")]
+async fn pre_tool_use_deny_fires_permission_denied_event() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, mut gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            // The agent's tool bridge must know `todo_write` so it parses + reaches the gate.
+            *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+
+            // Register the PreToolUse deny gate AND a PermissionDenied observe hook; without
+            // the latter subscribed, `dispatch_hook` stays inert (nothing is listening).
+            let mut client_hooks = crate::extensions::hooks::ClientHooks::new();
+            for event in [
+                xai_grok_hooks::event::HookEventName::PreToolUse,
+                xai_grok_hooks::event::HookEventName::PermissionDenied,
+            ] {
+                client_hooks.insert(
+                    event,
+                    vec![crate::extensions::hooks::ClientHookGroup {
+                        matcher: None,
+                        callback_ids: vec!["cb_0".to_string()],
+                        timeout: None,
+                    }],
+                );
+            }
+            *actor.client_hooks.borrow_mut() = client_hooks;
+
+            // Capture every `x.ai/hooks/event` observe notification; answer the reverse
+            // `x.ai/hooks/run` request with a deny and ack UI notifications so the gate runs.
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let seen = observed.clone();
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = gateway_rx.recv().await {
+                    match msg {
+                        xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                            let deny: Arc<serde_json::value::RawValue> =
+                                serde_json::value::to_raw_value(&serde_json::json!({
+                                    "decision": "deny",
+                                    "systemMessage": "nope",
+                                }))
+                                .unwrap()
+                                .into();
+                            let _ = args.response_tx.send(Ok(acp::ExtResponse::new(deny)));
+                        }
+                        xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
+                            if args.request.method.as_ref() == "x.ai/hooks/event" {
+                                let params: serde_json::Value =
+                                    serde_json::from_str(args.request.params.get()).unwrap();
+                                seen.lock().unwrap().push(params);
+                            }
+                        }
+                        xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let call = ToolCallResponse {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: crate::sampling::types::ToolCallFunction::new(
+                    "todo_write",
+                    r#"{"todos":[{"id":"t1","content":"do","status":"completed"}]}"#,
+                ),
+            };
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                actor.execute_tool_calls(vec![call]),
+            )
+            .await
+            .expect("execute_tool_calls must not hang")
+            .expect("execute_tool_calls must not error");
+
+            // Let the fire-and-forget observe notifications drain onto the gateway task.
+            tokio::task::yield_now().await;
+
+            let denied: Vec<_> = observed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p["hookEventName"] == "permission_denied")
+                .cloned()
+                .collect();
+            assert_eq!(
+                denied.len(),
+                1,
+                "a PreToolUse hook deny must fire exactly one PermissionDenied event, got {:?}",
+                observed.lock().unwrap()
+            );
+            assert_eq!(
+                denied[0]["toolName"], "todo_write",
+                "the PermissionDenied event must carry the resolved tool name"
+            );
+            assert_eq!(
+                denied[0]["toolUseId"], "call_1",
+                "the PermissionDenied event must carry the tool call id"
+            );
         })
         .await;
 }
