@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::{self, HookSpec};
 use crate::error::HookError;
@@ -14,13 +14,40 @@ use crate::matcher::HookMatcher;
 /// picked up by new sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookRegistry {
+    #[serde(deserialize_with = "deserialize_canonical_hooks")]
     hooks: HashMap<HookEventName, Vec<HookSpec>>,
+}
+
+/// Canonicalize alias buckets when restoring a registry from a serialized
+/// snapshot. Older snapshots may still contain a separate `SubagentEnd` key.
+fn deserialize_canonical_hooks<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<HookEventName, Vec<HookSpec>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let hooks = HashMap::<HookEventName, Vec<HookSpec>>::deserialize(deserializer)?;
+    let mut canonical: HashMap<HookEventName, Vec<HookSpec>> = HashMap::with_capacity(hooks.len());
+    for (event, specs) in hooks {
+        canonical
+            .entry(event.canonical())
+            .or_default()
+            .extend(specs);
+    }
+    Ok(canonical)
 }
 
 impl HookRegistry {
     /// Returns the hooks registered for the given event type.
+    ///
+    /// The event is collapsed to its canonical form before lookup so that
+    /// alias variants (e.g. `SubagentEnd` dispatched by the shell) resolve to
+    /// the same bucket a user's `SubagentStop` registration lands in.
     pub fn hooks_for(&self, event: HookEventName) -> &[HookSpec] {
-        self.hooks.get(&event).map(|v| v.as_slice()).unwrap_or(&[])
+        self.hooks
+            .get(&event.canonical())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Returns true if the registry contains no hooks at all.
@@ -34,9 +61,16 @@ impl HookRegistry {
     }
 
     /// Append additional hook specs into this registry.
+    ///
+    /// Specs are bucketed under the canonical event key so registration and
+    /// [`hooks_for`](Self::hooks_for) lookup always meet on one key regardless
+    /// of which alias spelling the spec used (`SubagentEnd` -> `SubagentStop`).
     pub fn append_specs(&mut self, specs: Vec<HookSpec>) {
         for spec in specs {
-            self.hooks.entry(spec.event).or_default().push(spec);
+            self.hooks
+                .entry(spec.event.canonical())
+                .or_default()
+                .push(spec);
         }
     }
 
@@ -59,8 +93,9 @@ impl HookRegistry {
         HookEventName::StopFailure,
         HookEventName::Notification,
         HookEventName::SubagentStart,
+        // `SubagentEnd` is intentionally omitted: it canonicalizes to
+        // `SubagentStop`, so iterating both would return that bucket twice.
         HookEventName::SubagentStop,
-        HookEventName::SubagentEnd,
         HookEventName::PreCompact,
         HookEventName::PostCompact,
         HookEventName::SessionEnd,
@@ -176,21 +211,24 @@ pub fn load_hooks_from_sources(
     // hooks that share a command/URL but have different matchers (e.g. tool-scoped
     // hooks) to all run.
     //
-    // Deduplication key: (event, command_raw, url_raw, configured_matcher).
+    // Deduplication key: (canonical event, command_raw, url_raw, configured_matcher).
     // Hooks with identical content + matcher are deduplicated regardless of
-    // source. Global hooks take precedence because they're loaded first.
+    // source. The event is canonicalized (`SubagentEnd` -> `SubagentStop`) so
+    // both bucketing and dedup meet the same key a `hooks_for` lookup uses,
+    // regardless of which alias spelling a spec declared. Global hooks take
+    // precedence because they're loaded first.
     let mut hooks: HashMap<HookEventName, Vec<HookSpec>> = HashMap::new();
     let mut seen_content: std::collections::HashSet<(HookEventName, String, String, String)> =
         std::collections::HashSet::new();
     for spec in all_specs {
         let key = (
-            spec.event,
+            spec.event.canonical(),
             spec.command_raw.clone().unwrap_or_default(),
             spec.url_raw.clone().unwrap_or_default(),
             spec.configured_matcher.clone().unwrap_or_default(),
         );
         if seen_content.insert(key) {
-            hooks.entry(spec.event).or_default().push(spec);
+            hooks.entry(spec.event.canonical()).or_default().push(spec);
         } else {
             tracing::debug!(
                 hook_name = %spec.name,
@@ -212,8 +250,9 @@ pub fn load_hooks_from_sources(
         notification = registry.hooks_for(HookEventName::Notification).len(),
         user_prompt_submit = registry.hooks_for(HookEventName::UserPromptSubmit).len(),
         subagent_start = registry.hooks_for(HookEventName::SubagentStart).len(),
-        subagent_stop = registry.hooks_for(HookEventName::SubagentStop).len()
-            + registry.hooks_for(HookEventName::SubagentEnd).len(),
+        // `SubagentEnd` canonicalizes to `SubagentStop`, so a single
+        // `hooks_for(SubagentStop)` already covers both spellings.
+        subagent_stop = registry.hooks_for(HookEventName::SubagentStop).len(),
         "hooks: discovery complete"
     );
 
@@ -589,6 +628,71 @@ mod tests {
         assert!(events.contains(&HookEventName::SubagentStart));
         assert!(events.contains(&HookEventName::SubagentStop));
         assert!(events.contains(&HookEventName::SubagentEnd));
+    }
+
+    #[test]
+    fn subagent_stop_registration_matches_subagent_end_dispatch() {
+        // Regression: hooks registered for `SubagentStop` must fire when the
+        // shell dispatches under the `SubagentEnd` alias. Registration and
+        // dispatch have to meet on one canonical key.
+        let dir = tempfile::tempdir().unwrap();
+        write_json(dir.path(), "stop.json", &simple_hook("SubagentStop"));
+
+        let (registry, errors) = load_hooks(Some(dir.path()), None);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+
+        // Dispatch key is the alias; it must resolve to the registered hook.
+        let hooks = registry.hooks_for(HookEventName::SubagentEnd);
+        assert_eq!(
+            hooks.len(),
+            1,
+            "SubagentStop hook should be reachable via a SubagentEnd dispatch"
+        );
+
+        // Both spellings resolve to the same canonical bucket.
+        assert_eq!(registry.hooks_for(HookEventName::SubagentStop).len(), 1);
+    }
+
+    #[test]
+    fn append_specs_canonicalizes_subagent_end_alias() {
+        // A spec declared under the `SubagentEnd` alias must be reachable via a
+        // `SubagentStop` lookup once appended.
+        let (specs, errors) =
+            config::parse_hook_file(&simple_hook("SubagentEnd"), Path::new("subagent-end.json"));
+        assert!(errors.is_empty(), "errors: {errors:?}");
+
+        let mut registry = HookRegistry::default();
+        registry.append_specs(specs);
+
+        assert_eq!(registry.hooks_for(HookEventName::SubagentStop).len(), 1);
+        assert_eq!(registry.hooks_for(HookEventName::SubagentEnd).len(), 1);
+    }
+
+    #[test]
+    fn deserialization_canonicalizes_subagent_end_alias() {
+        // Older serialized registries may have retained separate alias buckets.
+        let (stop_specs, stop_errors) = config::parse_hook_file(
+            &simple_hook_with_id("SubagentStop", "stop"),
+            Path::new("subagent-stop.json"),
+        );
+        let (end_specs, end_errors) = config::parse_hook_file(
+            &simple_hook_with_id("SubagentEnd", "end"),
+            Path::new("subagent-end.json"),
+        );
+        assert!(stop_errors.is_empty(), "errors: {stop_errors:?}");
+        assert!(end_errors.is_empty(), "errors: {end_errors:?}");
+
+        let serialized = serde_json::json!({
+            "hooks": {
+                "subagent_stop": serde_json::to_value(stop_specs).unwrap(),
+                "subagent_end": serde_json::to_value(end_specs).unwrap(),
+            }
+        });
+        let registry: HookRegistry = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(registry.hooks_for(HookEventName::SubagentStop).len(), 2);
+        assert_eq!(registry.hooks_for(HookEventName::SubagentEnd).len(), 2);
+        assert_eq!(registry.all_hooks().len(), 2);
     }
 
     #[test]
