@@ -311,6 +311,8 @@ Alt-screen policies:
 - `always` -- always enter fullscreen.
 - `never` -- never enter fullscreen; run inline in the main scrollback.
 
+CLI: `--alt-screen` forces fullscreen; `--no-alt-screen` forces inline (either overrides this setting).
+
 ### Plugins UI
 
 ```toml

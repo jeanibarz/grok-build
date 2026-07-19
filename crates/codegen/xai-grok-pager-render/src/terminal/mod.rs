@@ -989,7 +989,7 @@ fn terminal_name_from_term_program(value: &str) -> Option<TerminalName> {
 /// User-configured alt-screen (fullscreen) mode.
 ///
 /// Parsed from `[terminal] alt_screen` in `~/.grok/pager.toml` and
-/// overridden by the `--no-alt-screen` CLI flag.
+/// overridden by the `--alt-screen` / `--no-alt-screen` CLI flags.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AltScreenMode {
     /// Automatic: fullscreen in plain terminals and normal tmux, inline in
@@ -1097,23 +1097,30 @@ fn parse_tmux_major_minor(version: &str) -> Option<(u32, u32)> {
 /// config, and environment.
 ///
 /// Precedence:
-/// 1. `--no-alt-screen` CLI flag → always inline
+/// 1. CLI force flags (mutually exclusive at parse time):
+///    - `cli_force_alt_screen = Some(false)` (`--no-alt-screen`) → always inline
+///    - `cli_force_alt_screen = Some(true)` (`--alt-screen`) → always fullscreen
 /// 2. `config_mode` from `[terminal] alt_screen` → Always/Never/Auto
 /// 3. Auto rules:
 ///    - Zellij → inline
 ///    - tmux control mode → inline
 ///    - otherwise → fullscreen
 ///
+/// Hosts that need a full, attach-replayable buffer (e.g. Kookr under dtach)
+/// should pass `--alt-screen` so the TUI enters the alternate screen even when
+/// auto-detection would stay inline. Pair with a full repaint on SIGWINCH so
+/// attach clients receive a complete frame (see user-guide terminal support).
+///
 /// Returns `true` when the pager should enter the alternate screen.
 pub fn determine_alt_screen_policy(
-    cli_no_alt_screen: bool,
+    cli_force_alt_screen: Option<bool>,
     config_mode: AltScreenMode,
     ctx: &TerminalContext,
     is_control_mode: bool,
 ) -> bool {
     // CLI override has highest precedence.
-    if cli_no_alt_screen {
-        return false;
+    if let Some(force) = cli_force_alt_screen {
+        return force;
     }
 
     match config_mode {

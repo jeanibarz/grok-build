@@ -173,7 +173,7 @@ opens with next time.
 |-------|----------|
 | unset (default) | Legacy resolution: pager.toml `[terminal] minimal`, then the alt-screen policy. |
 | `"minimal"` | Open in minimal (scrollback-native) mode. |
-| `"fullscreen"` | Open in the standard TUI. Fullscreen-vs-inline still follows the alt-screen policy (`--no-alt-screen`, `[terminal] alt_screen`, terminal auto-detection), so environments like Zellij or tmux control mode keep their automatic inline fallback. |
+| `"fullscreen"` | Open in the standard TUI. Fullscreen-vs-inline still follows the alt-screen policy (`--alt-screen` / `--no-alt-screen`, `[terminal] alt_screen`, terminal auto-detection), so environments like Zellij or tmux control mode keep their automatic inline fallback unless a CLI force flag is set. |
 
 You normally never edit this key by hand — Grok writes it whenever you pass an
 explicit `--minimal` / `--fullscreen` flag or run `/minimal` / `/fullscreen`.
@@ -615,6 +615,13 @@ alt_screen = "auto"                   # fullscreen mode: "auto", "always", "neve
 - `auto` (default): Use alternate screen when the terminal supports it
 - `always`: Always use alternate screen
 - `never`: Run inline in the terminal's main scrollback buffer
+
+CLI overrides (highest precedence; mutually exclusive):
+
+- `--alt-screen` — force alternate screen for this session (same effect as `always`)
+- `--no-alt-screen` — force inline for this session (same effect as `never`)
+
+Use `--alt-screen` for remote supervisors (dtach / attach) that need a full, attach-replayable buffer. Frame paints still wrap DECSET 2026 synchronized output; see [Terminal Support](21-terminal-support.md#remote-attach--dtach-supervisors).
 
 ### Animation
 

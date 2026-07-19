@@ -665,7 +665,8 @@ fn byobu_screen_ctx() -> TerminalContext {
 #[derive(Debug)]
 struct AltScreenCase {
     name: &'static str,
-    cli_no_alt: bool,
+    /// `Some(true)` = `--alt-screen`, `Some(false)` = `--no-alt-screen`, `None` = no CLI force.
+    cli_force: Option<bool>,
     mode: AltScreenMode,
     ctx: TerminalContext,
     control: bool,
@@ -678,7 +679,7 @@ fn alt_screen_policy_matrix() {
         // Auto mode
         AltScreenCase {
             name: "auto_plain_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: plain_ctx(),
             control: false,
@@ -686,7 +687,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_tmux_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: tmux_ctx(),
             control: false,
@@ -694,7 +695,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_tmux_control_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: tmux_ctx(),
             control: true,
@@ -702,7 +703,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_zellij_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: zellij_ctx_test(),
             control: false,
@@ -710,7 +711,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_screen_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: screen_ctx(),
             control: false,
@@ -718,7 +719,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_byobu_tmux_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: byobu_tmux_ctx(),
             control: false,
@@ -726,7 +727,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_byobu_screen_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: byobu_screen_ctx(),
             control: false,
@@ -734,7 +735,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "auto_byobu_tmux_control_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Auto,
             ctx: byobu_tmux_ctx(),
             control: true,
@@ -743,7 +744,7 @@ fn alt_screen_policy_matrix() {
         // Never mode: always inline
         AltScreenCase {
             name: "never_plain_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: plain_ctx(),
             control: false,
@@ -751,7 +752,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "never_tmux_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: tmux_ctx(),
             control: false,
@@ -759,7 +760,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "never_screen_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: screen_ctx(),
             control: false,
@@ -767,7 +768,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "never_zellij_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: zellij_ctx_test(),
             control: false,
@@ -775,7 +776,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "never_byobu_tmux_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: byobu_tmux_ctx(),
             control: false,
@@ -783,7 +784,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "never_byobu_screen_inline",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Never,
             ctx: byobu_screen_ctx(),
             control: false,
@@ -792,7 +793,7 @@ fn alt_screen_policy_matrix() {
         // Always mode: forces fullscreen
         AltScreenCase {
             name: "always_plain_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: plain_ctx(),
             control: false,
@@ -800,7 +801,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "always_tmux_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: tmux_ctx(),
             control: false,
@@ -808,7 +809,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "always_tmux_control_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: tmux_ctx(),
             control: true,
@@ -816,7 +817,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "always_zellij_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: zellij_ctx_test(),
             control: false,
@@ -824,7 +825,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "always_screen_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: screen_ctx(),
             control: false,
@@ -832,7 +833,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "always_byobu_screen_fullscreen",
-            cli_no_alt: false,
+            cli_force: None,
             mode: AltScreenMode::Always,
             ctx: byobu_screen_ctx(),
             control: false,
@@ -841,7 +842,7 @@ fn alt_screen_policy_matrix() {
         // CLI --no-alt-screen overrides everything
         AltScreenCase {
             name: "cli_no_alt_overrides_auto",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Auto,
             ctx: plain_ctx(),
             control: false,
@@ -849,7 +850,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "cli_no_alt_overrides_always",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Always,
             ctx: plain_ctx(),
             control: false,
@@ -857,7 +858,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "cli_no_alt_overrides_never",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Never,
             ctx: plain_ctx(),
             control: false,
@@ -865,7 +866,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "cli_no_alt_overrides_auto_in_tmux",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Auto,
             ctx: tmux_ctx(),
             control: false,
@@ -873,7 +874,7 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "cli_no_alt_overrides_always_in_zellij",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Always,
             ctx: zellij_ctx_test(),
             control: false,
@@ -881,17 +882,58 @@ fn alt_screen_policy_matrix() {
         },
         AltScreenCase {
             name: "cli_no_alt_overrides_always_in_tmux_control",
-            cli_no_alt: true,
+            cli_force: Some(false),
             mode: AltScreenMode::Always,
             ctx: tmux_ctx(),
             control: true,
             expected: false,
         },
+        // CLI --alt-screen forces fullscreen even when auto would stay inline
+        AltScreenCase {
+            name: "cli_alt_overrides_auto_zellij",
+            cli_force: Some(true),
+            mode: AltScreenMode::Auto,
+            ctx: zellij_ctx_test(),
+            control: false,
+            expected: true,
+        },
+        AltScreenCase {
+            name: "cli_alt_overrides_auto_tmux_control",
+            cli_force: Some(true),
+            mode: AltScreenMode::Auto,
+            ctx: tmux_ctx(),
+            control: true,
+            expected: true,
+        },
+        AltScreenCase {
+            name: "cli_alt_overrides_config_never",
+            cli_force: Some(true),
+            mode: AltScreenMode::Never,
+            ctx: plain_ctx(),
+            control: false,
+            expected: true,
+        },
+        AltScreenCase {
+            name: "cli_alt_overrides_never_in_zellij",
+            cli_force: Some(true),
+            mode: AltScreenMode::Never,
+            ctx: zellij_ctx_test(),
+            control: false,
+            expected: true,
+        },
+        AltScreenCase {
+            name: "cli_alt_keeps_auto_plain_fullscreen",
+            cli_force: Some(true),
+            mode: AltScreenMode::Auto,
+            ctx: plain_ctx(),
+            control: false,
+            expected: true,
+        },
     ];
 
     for case in &cases {
         let result =
-            determine_alt_screen_policy(case.cli_no_alt, case.mode, &case.ctx, case.control);
+            determine_alt_screen_policy(case.cli_force, case.mode, &case.ctx, case.control);
         assert_eq!(
             result, case.expected,
             "alt_screen_policy failed on case '{}'",
@@ -928,7 +970,7 @@ fn auto_byobu_screen_is_fullscreen() {
         ..Default::default()
     };
     assert!(determine_alt_screen_policy(
-        false,
+        None,
         AltScreenMode::Auto,
         &ctx,
         false
