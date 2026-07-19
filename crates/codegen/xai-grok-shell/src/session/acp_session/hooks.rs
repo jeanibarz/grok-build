@@ -173,6 +173,11 @@ impl SessionActor {
     /// Block a tool call denied by a `PreToolUse` hook (file- or client-side),
     /// emitting the shared telemetry + UI side-effects and returning the
     /// [`ToolLoop::HookDenied`] the caller should propagate.
+    ///
+    /// `raw_input` is the untruncated tool argument payload; it is truncated here
+    /// and carried on the `PermissionDenied` hook event so subscribers observe the
+    /// same lifecycle sequence a permission-manager deny produces (see the
+    /// `Decision::PolicyDeny | Reject` dispatch in `tool_calls.rs`).
     pub(super) async fn deny_tool(
         &self,
         model_call_id: &str,
@@ -180,6 +185,7 @@ impl SessionActor {
         tool_name: String,
         hook_name: String,
         reason: String,
+        raw_input: serde_json::Value,
     ) -> Result<ToolLoop, acp::Error> {
         tracing::info!(%tool_name, %hook_name, %reason, "tool call denied by pre_tool_use hook");
         xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::HookBlocked {
@@ -195,6 +201,23 @@ impl SessionActor {
             "\u{26a0} `{tool_name}` blocked by hook `{hook_name}`: {reason}"
         ))
         .await;
+        // Fire `PermissionDenied` on the hook-deny path too, mirroring the
+        // permission-manager deny branch; without this, subscribers only see a
+        // `PreToolUse` with no matching terminal event.
+        let (tool_input, tool_input_truncated) =
+            xai_grok_hooks::event::truncate_payload(raw_input);
+        self.dispatch_hook(
+            HookEventName::PermissionDenied,
+            HookPayload::PermissionDenied {
+                tool_name: tool_name.clone(),
+                tool_use_id: tool_call_id.to_string(),
+                tool_input,
+                tool_input_truncated,
+            },
+            None,
+            Some(&tool_name),
+        )
+        .await;
         Ok(ToolLoop::HookDenied { hook_name })
     }
 
@@ -209,6 +232,7 @@ impl SessionActor {
         call: &ToolCallResponse,
         tool_call_id: &acp::ToolCallId,
         envelope: &HookEventEnvelope,
+        raw_input: &serde_json::Value,
     ) -> Result<Option<ToolLoop>, acp::Error> {
         // Clone the matched groups so we don't hold the `client_hooks` borrow across the
         // dispatch awaits below.
@@ -278,6 +302,7 @@ impl SessionActor {
                         // attribute the block, not collapse every client hook to "client".
                         format!("client:{callback_id}"),
                         reason,
+                        raw_input.clone(),
                     )
                     .await?,
                 ));

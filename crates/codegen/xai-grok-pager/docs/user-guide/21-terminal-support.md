@@ -126,7 +126,39 @@ This setting is off by default for security reasons. Without it, OSC 52 writes f
 **Fix**:
 - In Zellij or control mode, Grok intentionally runs inline (no alt screen).
 - Set `[terminal] alt_screen = "always"` in `~/.grok/pager.toml` to force fullscreen.
-- Use the CLI flag `--no-alt-screen` to disable alt-screen mode entirely (useful for debugging or when the alternate screen causes issues in your terminal).
+- Or pass the CLI flag `--alt-screen` to force the alternate screen for a single session (overrides config and auto-detection; useful for remote supervisors under dtach / node-pty that need a full attach-replayable buffer).
+- Use the CLI flag `--no-alt-screen` to disable alt-screen mode entirely (useful for debugging or when the alternate screen causes issues in your terminal). `--alt-screen` and `--no-alt-screen` are mutually exclusive.
+
+### Remote attach / dtach supervisors
+
+Hosts that wrap Grok in **dtach** (or similar multi-attach PTYs) often pass `--no-alt-screen` so the TUI paints into the main buffer. Differential inline painting leaves attach clients with an empty or incomplete replay frame when the session is idle.
+
+**Full viewport repaint contract** (works with both `--no-alt-screen` and alt-screen):
+
+| Trigger | Grok behavior |
+|---------|----------------|
+| **SIGWINCH / `Event::Resize`** (including same-size) | After a short debounce (~16 ms), Grok clears the viewport back-buffer and emits one full synchronized frame (DECSET 2026) of every cell — not only dirty cells. Safe for attach clients that re-assert the PTY size on connect. |
+| **Ctrl+L** (form feed / `CSI` form feed key) | Forces an immediate full clear + viewport paint, then normal action routing (extensions modal, VS Code–family interject, etc.). Prefer SIGWINCH when you only need a snapshot and must not inject keystrokes into the agent session. |
+
+Remote supervisors should:
+
+1. Pin attach PTY geometry to the live session size (e.g. ~200 cols for dashboard panes).
+2. On multi-attach / `dtach -a`, either send a resize (same size is fine) **or** inject Ctrl+L if a full frame is still missing after VT reconstruction.
+3. Prefer **SIGWINCH** for passive attach recovery so the agent does not receive form feed as input.
+
+**Recommended for attach-friendly sessions** (once validated under your multiplexer):
+
+```bash
+grok --alt-screen
+```
+
+Effects:
+
+1. Grok enters the terminal **alternate screen** (same as `[terminal] alt_screen = "always"`).
+2. Frame updates still use **DECSET 2026 synchronized output** (`CSI ? 2026 h` / `l`) so each paint is atomic — terminals and attach clients that honor 2026 present whole frames; clients that ignore it fall back to streaming the same bytes.
+3. Full viewport repaint on SIGWINCH and Ctrl+L (see table above) so `dtach -a` / node-pty attach at the correct size receives a complete current UI.
+
+Default interactive launches remain unchanged: without either CLI force flag, policy follows `[terminal] alt_screen` (`auto` / `always` / `never`) and environment heuristics (inline under Zellij and tmux control mode).
 
 ### Problem: Zellij keybindings interfere with Grok (Ctrl+g, Ctrl+o, etc.)
 

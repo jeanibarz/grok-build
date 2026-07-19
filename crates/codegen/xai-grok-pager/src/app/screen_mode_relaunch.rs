@@ -327,10 +327,11 @@ pub(crate) fn parse_screen_mode(value: Option<&str>) -> Option<super::ScreenMode
 /// screen mode the user never asked for.
 ///
 /// When set, the returned mode **wins** over CLI flags (`--minimal`,
-/// `--no-alt-screen`), config (`[terminal] minimal`, `alt_screen`), and
-/// auto-inline environment heuristics — see [`resolve_screen_mode`]. That way
-/// `/fullscreen` always reopens in alt-screen fullscreen — not inline — even
-/// under Zellij, `alt_screen = never`, or a preserved `--no-alt-screen`.
+/// `--alt-screen` / `--no-alt-screen`), config (`[terminal] minimal`,
+/// `alt_screen`), and auto-inline environment heuristics — see
+/// [`resolve_screen_mode`]. That way `/fullscreen` always reopens in alt-screen
+/// fullscreen — not inline — even under Zellij, `alt_screen = never`, or a
+/// preserved `--no-alt-screen`.
 ///
 /// Call once, early in [`crate::app::run`].
 pub(crate) fn take_screen_mode_env_override() -> Option<super::ScreenMode> {
