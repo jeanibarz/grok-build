@@ -65,6 +65,8 @@ killed/relaunched (new launches only).
 ### What not to do
 
 - Do **not** treat `pnpm prod:update` as “deploy the new Grok binary.”
+- Do **not** run `pnpm prod:update` / `prod:restart` (or otherwise restart
+  Kookr) without an explicit operator OK — even if a rebuild just finished.
 - Do **not** run `pnpm grok:rebuild` while `~/git/grok-build` is still on a
   stale branch/SHA (e.g. old `feat/claude-compat` behind `origin/main`) unless
   you intentionally want that SHA — the script builds whatever is checked out
@@ -72,14 +74,21 @@ killed/relaunched (new launches only).
 - Do **not** stop after “PR merged” for attach/TUI/hook fixes; the merge alone
   does not change `/home/jean/bin/grok`.
 
-### When to also restart Kookr
+### When to also restart Kookr — **ask first, never auto-restart**
 
 - **Binary-only fork fix** (this repo): `pnpm grok:rebuild` is enough for *new*
   sessions; no Kookr restart required if `KOOKR_GROK_BIN` already points at
-  `~/bin/grok`.
-- **Kookr server / adapter / attach pipeline change** (`~/git/kookr`): still use
-  `cd ~/git/kookr && pnpm prod:update` (or `prod:restart`) as documented there —
-  that path is independent of this binary rebuild.
+  `~/bin/grok`. Do the rebuild automatically; **do not** restart Kookr unless
+  the operator asked for it.
+- **Any Kookr process restart** (`pnpm prod:update`, `pnpm prod:restart`,
+  `scripts/prod-restart.sh`, killing port 4800, systemd restart of kookr,
+  or any other action that restarts the live Kookr server): **always ask the
+  operator and wait for explicit yes** before running it. Auto-rebuild of
+  `~/bin/grok` is authorized; auto-restart of Kookr is **not**.
+- If a Kookr server / adapter / attach-pipeline change *would* benefit from a
+  restart, say so in the task summary and offer the exact command
+  (`cd ~/git/kookr && pnpm prod:update` or `prod:restart`) — then stop until
+  confirmed. That path is independent of this binary rebuild.
 
 ## Worktrees
 
