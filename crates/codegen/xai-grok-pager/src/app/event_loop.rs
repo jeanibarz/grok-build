@@ -2124,8 +2124,9 @@ pub(crate) async fn run(
                 schedule_tick(&mut animation_tick_at, &app, tick_interval);
                 if result.needs_draw || tip_shown {
                     if result.force_repaint {
-                        // Refocus heal wins over the resize debounce: a coalesced same-size
-                        // resize wouldn't autoresize-clear, so clear + full repaint now.
+                        // Full clear+repaint wins over the resize debounce: refocus heal,
+                        // Ctrl+L redraw, or a coalesced same-size resize that would not
+                        // autoresize-clear must still emit a complete viewport frame.
                         resize_debounce_at = None;
                         presenter.request(true);
                     } else if result.resize_only && !tip_shown {
@@ -2145,9 +2146,11 @@ pub(crate) async fn run(
             }
 
             // Debounced resize: draw once the terminal size has stabilized.
+            // Force full repaint so same-size SIGWINCH (remote attach recovery)
+            // still emits a complete viewport synchronized frame, not only dirty cells.
             _ = resize_debounce => {
                 resize_debounce_at = None;
-                presenter.request(false);
+                presenter.request(true);
                 schedule_tick(&mut animation_tick_at, &app, tick_interval);
             }
 
@@ -2853,9 +2856,33 @@ struct DrainResult {
     /// When true, the caller should debounce the draw to avoid redundant layout
     /// rebuilds during continuous terminal resize drags.
     resize_only: bool,
-    /// Whether the next draw must be preceded by a full clear+repaint, set on
-    /// refocus in editor/multiplexer contexts to heal out-of-band stranded rows.
+    /// Whether the next draw must be preceded by a full clear+repaint.
+    /// Set on refocus in editor/multiplexer contexts (heal out-of-band stranded
+    /// rows) and on Ctrl+L (form feed) so remote attach / blank clients receive
+    /// a complete viewport synchronized frame, not only dirty cells.
     force_repaint: bool,
+}
+
+/// True when `ev` is Ctrl+L (form feed) — the classic terminal "redraw" chord.
+///
+/// Hosts (dtach multi-attach, Kookr, node-pty) inject form feed after attach to
+/// request a full viewport paint under `--no-alt-screen` differential rendering.
+/// Always honor the chord for force-repaint; action routing (plugins / interject)
+/// still runs independently and paints the resulting UI fully.
+fn is_ctrl_l_redraw_chord(ev: &Event) -> bool {
+    match ev {
+        Event::Key(ke)
+            if ke.kind != KeyEventKind::Release
+                && matches!(ke.code, KeyCode::Char('l') | KeyCode::Char('L'))
+                && ke.modifiers.contains(KeyModifiers::CONTROL)
+                && !ke.modifiers.intersects(
+                    KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER,
+                ) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 struct RoutedInputEvent {
@@ -2958,6 +2985,14 @@ async fn drain_and_process(
 
     let mut handle_one = |routed: &RoutedInputEvent| -> bool {
         let ev = &routed.event;
+        // Ctrl+L (form feed): always force a full clear+repaint so attach clients
+        // that missed prior differential frames can recover a complete screen.
+        // Runs before action routing so Interject/OpenExtensions still work and
+        // paint fully after the clear.
+        if is_ctrl_l_redraw_chord(ev) {
+            force_repaint = true;
+            needs_draw = true;
+        }
         match ev {
             Event::FocusGained => {
                 // Force a full repaint on refocus to heal out-of-band stranded rows.
@@ -3563,6 +3598,37 @@ fn process_effects(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    // ── is_ctrl_l_redraw_chord ───────────────────────────────────────────
+
+    #[test]
+    fn ctrl_l_redraw_chord_matches_form_feed_only() {
+        use KeyEventKind::{Press, Release, Repeat};
+        let hit = |code, mods, kind| {
+            is_ctrl_l_redraw_chord(&Event::Key(KeyEvent {
+                code,
+                modifiers: mods,
+                kind,
+                state: KeyEventState::NONE,
+            }))
+        };
+        let (l, L, ctrl, none) = (
+            KeyCode::Char('l'),
+            KeyCode::Char('L'),
+            KeyModifiers::CONTROL,
+            KeyModifiers::NONE,
+        );
+        assert!(hit(l, ctrl, Press));
+        assert!(hit(L, ctrl, Press));
+        assert!(hit(l, ctrl, Repeat));
+        assert!(hit(l, ctrl | KeyModifiers::SHIFT, Press)); // Ctrl+Shift+L still form-feed family
+        assert!(!hit(l, ctrl, Release));
+        assert!(!hit(l, none, Press));
+        assert!(!hit(l, ctrl | KeyModifiers::ALT, Press));
+        assert!(!hit(KeyCode::Char('c'), ctrl, Press));
+        assert!(!is_ctrl_l_redraw_chord(&Event::Resize(80, 24)));
+        assert!(!is_ctrl_l_redraw_chord(&Event::FocusGained));
+    }
 
     // ── is_voice_chord ───────────────────────────────────────────────────
 
