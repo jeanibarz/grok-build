@@ -705,8 +705,20 @@ pub struct PagerArgs {
     /// Set the installer field in config.toml.
     #[arg(long = "installer", value_name = "VALUE", hide = true)]
     pub installer: Option<String>,
+    /// Force the terminal alternate screen (fullscreen TUI buffer).
+    ///
+    /// Overrides `[terminal] alt_screen` and auto-detection (Zellij, tmux
+    /// control mode). Useful for remote supervisors (dtach / node-pty attach)
+    /// that need a full, attach-replayable frame rather than differential
+    /// inline painting. Mutually exclusive with `--no-alt-screen`.
+    #[arg(long = "alt-screen", conflicts_with = "no_alt_screen")]
+    pub alt_screen: bool,
     /// Run inline instead of using the terminal alternate screen.
-    #[arg(long = "no-alt-screen")]
+    ///
+    /// Overrides `[terminal] alt_screen` and auto-detection. Useful for
+    /// debugging, scrollback under multiplexers, or hosts that intentionally
+    /// prefer inline painting. Mutually exclusive with `--alt-screen`.
+    #[arg(long = "no-alt-screen", conflicts_with = "alt_screen")]
     pub no_alt_screen: bool,
     /// Experimental: scrollback-native rendering. Finalized blocks are printed
     /// into the terminal's native scrollback (use the terminal's own scroll /
@@ -718,7 +730,8 @@ pub struct PagerArgs {
     /// Open in the standard fullscreen TUI for this session, overriding a
     /// config `[ui] screen_mode = "minimal"` preference. Session-scoped only —
     /// does not write config. Fullscreen-vs-inline still follows the alt-screen
-    /// policy (--no-alt-screen, [terminal] alt_screen, terminal auto-detection).
+    /// policy (--alt-screen / --no-alt-screen, [terminal] alt_screen, terminal
+    /// auto-detection).
     #[arg(long = "fullscreen", conflicts_with = "minimal")]
     pub fullscreen: bool,
     /// Write sampling events to ~/.grok/logs/sampling.jsonl.
@@ -770,6 +783,21 @@ pub enum ResumeTarget {
     None,
 }
 impl PagerArgs {
+    /// CLI force for alt-screen policy.
+    ///
+    /// - `Some(true)` — `--alt-screen` (force fullscreen / alternate buffer)
+    /// - `Some(false)` — `--no-alt-screen` (force inline)
+    /// - `None` — follow `[terminal] alt_screen` + environment auto-detection
+    pub fn cli_force_alt_screen(&self) -> Option<bool> {
+        if self.alt_screen {
+            Some(true)
+        } else if self.no_alt_screen {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Parse CLI arguments and apply `--cwd` if provided.
     pub fn parse_and_apply_cwd() -> anyhow::Result<Self> {
         let bin_name = std::env::args()

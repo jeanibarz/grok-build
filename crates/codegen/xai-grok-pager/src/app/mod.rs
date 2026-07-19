@@ -636,7 +636,7 @@ pub async fn run(
     let term_ctx = crate::terminal::terminal_context();
     let is_control_mode = crate::terminal::detect_tmux_control_mode(term_ctx);
     let alt_screen_wants_fullscreen = crate::terminal::determine_alt_screen_policy(
-        args.no_alt_screen,
+        args.cli_force_alt_screen(),
         alt_screen_config_mode,
         term_ctx,
         is_control_mode,
@@ -667,10 +667,11 @@ pub async fn run(
     tracing::info!(
         use_alt_screen = screen_mode.is_fullscreen(), minimal = screen_mode.is_minimal(),
         mouse_capture = ! screen_mode.is_minimal(), minimal_live_rows = config_watcher
-        .current().minimal_live_rows, is_control_mode, no_alt_screen_cli = args
-        .no_alt_screen, minimal_cli = args.minimal, fullscreen_cli = args.fullscreen,
-        config_screen_mode = ? config_screen_mode, auto_minimal_mouse_leak, config_mode =
-        ? alt_screen_config_mode, multiplexer = ? term_ctx.multiplexer,
+        .current().minimal_live_rows, is_control_mode, alt_screen_cli = args.alt_screen,
+        no_alt_screen_cli = args.no_alt_screen, minimal_cli = args.minimal,
+        fullscreen_cli = args.fullscreen, config_screen_mode = ? config_screen_mode,
+        auto_minimal_mouse_leak, config_mode = ? alt_screen_config_mode,
+        multiplexer = ? term_ctx.multiplexer,
         "resolved fullscreen policy"
     );
     engage_startup_theme(screen_mode);
@@ -1819,11 +1820,31 @@ mod tests {
     fn cli_no_alt_screen_flag_parses() {
         let args = try_parse_pager(&["grok-pager", "--no-alt-screen"]).unwrap();
         assert!(args.no_alt_screen);
+        assert!(!args.alt_screen);
+        assert_eq!(args.cli_force_alt_screen(), Some(false));
     }
     #[test]
-    fn cli_no_alt_screen_default_false() {
+    fn cli_alt_screen_flag_parses() {
+        let args = try_parse_pager(&["grok-pager", "--alt-screen"]).unwrap();
+        assert!(args.alt_screen);
+        assert!(!args.no_alt_screen);
+        assert_eq!(args.cli_force_alt_screen(), Some(true));
+    }
+    #[test]
+    fn cli_alt_screen_flags_default_none() {
         let args = try_parse_pager(&["grok-pager"]).unwrap();
         assert!(!args.no_alt_screen);
+        assert!(!args.alt_screen);
+        assert_eq!(args.cli_force_alt_screen(), None);
+    }
+    #[test]
+    fn cli_alt_screen_and_no_alt_screen_conflict() {
+        let err = try_parse_pager(&["grok-pager", "--alt-screen", "--no-alt-screen"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected clap conflict error, got: {msg}"
+        );
     }
     #[test]
     fn cli_command_name_is_grok() {

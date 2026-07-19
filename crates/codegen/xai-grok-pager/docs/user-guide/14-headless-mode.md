@@ -581,7 +581,8 @@ These flags supplement the [Command-Line Options](#command-line-options) table a
 | `--no-subagents`              | Disable subagent spawning                         |
 | `--no-memory`                 | Disable cross-session memory                      |
 | `--disable-web-search`        | Disable web search and fetch tools                |
-| `--no-alt-screen`             | Run inline (no alternate screen)                  |
+| `--alt-screen`                | Force alternate screen (fullscreen buffer; overrides config/auto) |
+| `--no-alt-screen`             | Run inline (no alternate screen; overrides config/auto) |
 | `--worktree [NAME]`           | Start session in a new git worktree               |
 | `--ref <REF>` / `--worktree-ref <REF>` | Branch/tag/commit to base the worktree on (with `--worktree`) |
 

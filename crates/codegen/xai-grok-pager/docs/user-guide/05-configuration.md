@@ -180,7 +180,7 @@ you for that session only.
 | Value | Behavior |
 |-------|----------|
 | unset | Settings shows **Fullscreen**. At startup there is no sticky preference: legacy `pager.toml` `[terminal] minimal` can still force minimal, and terminals that leak mouse reports (JediTerm/Windows) may auto-open minimal until you set an explicit value. Otherwise the alt-screen policy picks fullscreen vs inline. |
-| `"fullscreen"` | Sticky non-minimal. Fullscreen-vs-inline still follows the alt-screen policy (`--no-alt-screen`, `[terminal] alt_screen`, terminal auto-detection). |
+| `"fullscreen"` | Sticky non-minimal. Fullscreen-vs-inline still follows the alt-screen policy (`--alt-screen` / `--no-alt-screen`, `[terminal] alt_screen`, terminal auto-detection), so environments like Zellij or tmux control mode keep their automatic inline fallback unless a CLI force flag is set. |
 | `"minimal"` | Sticky minimal (scrollback-native) mode. |
 
 A CLI flag always wins over the config value for that invocation.
@@ -642,6 +642,13 @@ alt_screen = "auto"                   # fullscreen mode: "auto", "always", "neve
 - `auto` (default): Use alternate screen when the terminal supports it
 - `always`: Always use alternate screen
 - `never`: Run inline in the terminal's main scrollback buffer
+
+CLI overrides (highest precedence; mutually exclusive):
+
+- `--alt-screen` — force alternate screen for this session (same effect as `always`)
+- `--no-alt-screen` — force inline for this session (same effect as `never`)
+
+Use `--alt-screen` for remote supervisors (dtach / attach) that need a full, attach-replayable buffer. Frame paints still wrap DECSET 2026 synchronized output; see [Terminal Support](21-terminal-support.md#remote-attach--dtach-supervisors).
 
 ### Animation
 
