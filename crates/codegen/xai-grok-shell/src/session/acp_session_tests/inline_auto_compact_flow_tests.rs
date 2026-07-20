@@ -70,7 +70,7 @@ async fn create_test_actor(
         },
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         auth_method_id: test_auth_method_id("test-auth"),
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
         state,
@@ -111,6 +111,7 @@ async fn create_test_actor(
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
+            tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
@@ -228,7 +229,6 @@ async fn create_test_actor(
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
@@ -398,8 +398,7 @@ fn initial_injection_backend_params_use_override_min_score() {
         watcher: None,
         stale_claim_secs: 60,
         search_source: "tool",
-        api_key_provider: None,
-        auth_credentials: None,
+        embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
     };
     let initial_injection = crate::config::MemoryInitialInjectionConfig {
         enabled: true,
@@ -427,8 +426,7 @@ fn initial_injection_backend_params_preserve_default_zero_min_score() {
         watcher: None,
         stale_claim_secs: 60,
         search_source: "tool",
-        api_key_provider: None,
-        auth_credentials: None,
+        embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
     };
     let (adjusted, effective_min_score) = build_initial_injection_backend_params(
         &params,
@@ -505,7 +503,7 @@ async fn create_test_actor_with_memory(
         },
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         auth_method_id: test_auth_method_id("test-auth"),
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
         state,
@@ -543,6 +541,7 @@ async fn create_test_actor_with_memory(
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
+            tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
@@ -673,7 +672,6 @@ async fn create_test_actor_with_memory(
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
@@ -1257,7 +1255,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 },
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 auth_method_id: test_auth_method_id("cached_token"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 auth_manager: {
                     let dir = tempfile::tempdir().unwrap();
                     let mgr = std::sync::Arc::new(crate::auth::AuthManager::new(
@@ -1311,6 +1309,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -1436,7 +1435,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),

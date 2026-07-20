@@ -7,12 +7,12 @@ use super::setters::{
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
     set_fork_secondary_model_inner, set_group_tool_verbs_inner, set_hunk_tracker_mode_inner,
     set_invert_scroll_inner, set_keep_text_selection_inner, set_max_thoughts_width_inner,
-    set_multiline_mode, set_prompt_suggestions_inner, set_remember_tool_approvals_inner,
-    set_render_mermaid_inner, set_respect_manual_folds_inner, set_scroll_lines_inner,
-    set_scroll_mode_inner, set_scroll_speed_inner, set_show_thinking_blocks_inner,
-    set_show_tips_inner, set_simple_mode_inner, set_theme_inner, set_timestamps,
-    set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
-    set_voice_stt_language_inner,
+    set_multiline_mode, set_page_flip_on_send_inner, set_prompt_suggestions_inner,
+    set_remember_tool_approvals_inner, set_render_mermaid_inner, set_respect_manual_folds_inner,
+    set_screen_mode_inner, set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
+    set_voice_capture_mode_inner, set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -64,6 +64,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
             _ => None,
         };
         if let Some(state) = state_opt {
+            state.rebuild_rows();
             state.ui_snapshot = ui_snapshot.clone();
             state.pager_snapshot = crate::settings::PagerLocalSnapshot {
                 multiline_mode: agent.multiline_mode,
@@ -686,6 +687,8 @@ pub(in crate::app::dispatch) fn action_for_reset(
     match (key, value) {
         ("compact_mode", SettingValue::Bool(b)) => Some(Action::SetCompactMode(*b)),
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
+        ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
+        ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
         ("simple_mode", SettingValue::Bool(b)) => Some(Action::SetSimpleMode(*b)),
         ("contextual_hints.undo", SettingValue::Bool(b)) => Some(Action::SetContextualHintUndo(*b)),
         ("contextual_hints.plan_mode", SettingValue::Bool(b)) => {
@@ -702,6 +705,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("contextual_hints.word_select", SettingValue::Bool(b)) => {
             Some(Action::SetContextualHintWordSelect(*b))
+        }
+        ("contextual_hints.ssh_wrap", SettingValue::Bool(b)) => {
+            Some(Action::SetContextualHintSshWrap(*b))
         }
         ("multiline_mode", SettingValue::Bool(b)) => Some(Action::SetMultilineMode(*b)),
         ("render_mermaid", SettingValue::Enum(s)) => {
@@ -798,7 +804,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         // max_thoughts_width: direct round-trip.
         ("max_thoughts_width", SettingValue::Int(i)) => Some(Action::SetMaxThoughtsWidth(*i)),
         // coding_data_sharing: "opt-in" / "opt-out" → bool.
-        // "opt-out" arm is a skew guard (default is "opt-in").
+        // Both arms needed (registry default is "opt-out").
         ("coding_data_sharing", SettingValue::Enum("opt-in")) => {
             Some(Action::SetCodingDataSharing { opted_in: true })
         }
@@ -823,6 +829,7 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("hunk_tracker_mode", SettingValue::Enum(s)) => {
             Some(Action::SetHunkTrackerMode((*s).to_string()))
         }
+        ("screen_mode", SettingValue::Enum(s)) => Some(Action::SetScreenMode((*s).to_string())),
         ("voice_capture_mode", SettingValue::Enum(s)) => {
             Some(Action::SetVoiceCaptureMode((*s).to_string()))
         }
@@ -870,6 +877,8 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
     match (key, rollback_value) {
         ("compact_mode", SettingValue::Bool(b)) => set_compact_mode_inner(app, *b),
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
+        ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
+        ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
         ("simple_mode", SettingValue::Bool(b)) => set_simple_mode_inner(app, *b),
         ("contextual_hints.undo", SettingValue::Bool(b)) => {
             set_contextual_hint_inner(app, |h, v| h.undo = v, *b)
@@ -888,6 +897,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         }
         ("contextual_hints.word_select", SettingValue::Bool(b)) => {
             set_contextual_hint_inner(app, |h, v| h.word_select = v, *b)
+        }
+        ("contextual_hints.ssh_wrap", SettingValue::Bool(b)) => {
+            set_contextual_hint_inner(app, |h, v| h.ssh_wrap = v, *b)
         }
         ("respect_manual_folds", SettingValue::Bool(b)) => set_respect_manual_folds_inner(app, *b),
         ("theme", SettingValue::Enum(s)) => set_theme_inner(app, s),
@@ -1071,6 +1083,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         // hunk_tracker_mode: restore the in-memory ui mirror.
         ("hunk_tracker_mode", SettingValue::Enum(s)) => {
             set_hunk_tracker_mode_inner(app, crate::settings::canonical_hunk_tracker_mode(Some(s)));
+        }
+        ("screen_mode", SettingValue::Enum(s)) => {
+            set_screen_mode_inner(app, crate::settings::canonical_screen_mode(Some(s)));
         }
         ("voice_capture_mode", SettingValue::Enum(s)) => {
             set_voice_capture_mode_inner(

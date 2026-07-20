@@ -19,7 +19,7 @@ const CANCEL_HINT: &str = "Ctrl+c:cancel";
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn spinner_reappears_after_wait_resumes() {
     let content = ContentController::start().await.expect("start content");
     let park_flag = content.home().join("spinner_park_flag");
@@ -139,10 +139,11 @@ async fn spinner_reappears_after_wait_resumes() {
 
     std::fs::write(&id_ready_flag, b"ready").expect("release id-extraction hold");
 
-    // Parked look: the marker renders and the running chrome (turn-status
-    // row / cancel keybar) drops — the session reads as stopped.
+    // Parked look: the plain marker renders, the "watching · …" cue takes
+    // the status row, and the running chrome (cancel keybar) drops — the
+    // session reads as stopped.
     harness
-        .wait_for_text("1 command still running", Duration::from_secs(60))
+        .wait_for_text("Worked for", Duration::from_secs(60))
         .unwrap_or_else(|_| {
             panic!(
                 "parked marker never appeared; screen:\n{}\n--- non-system messages ---\n{}",
@@ -150,11 +151,14 @@ async fn spinner_reappears_after_wait_resumes() {
                 dump_non_system_messages(&content.request_bodies())
             )
         });
-    assert!(
-        harness.contains_text("Worked for"),
-        "the parked marker keeps the completion prefix; screen:\n{}",
-        harness.screen_contents()
-    );
+    harness
+        .wait_for_text("watching · 1 command", Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            panic!(
+                "parked watching cue never appeared; screen:\n{}",
+                harness.screen_contents()
+            )
+        });
     let chrome_hidden = wait_until(Duration::from_secs(10), || {
         harness.update(Duration::from_millis(100));
         !harness.contains_text(CANCEL_HINT)
@@ -202,7 +206,9 @@ async fn spinner_reappears_after_wait_resumes() {
 
     // Let the turn end cleanly (drop pacing so the tail flushes fast).
     content.set_chunk_delay(None);
-    wait_for_turn_idle(&mut harness);
+    harness
+        .wait_for_turn_idle(Duration::from_secs(15))
+        .expect("turn idle");
 
     assert!(
         !harness.contains_text("panicked"),

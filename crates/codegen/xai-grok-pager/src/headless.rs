@@ -13,11 +13,13 @@ use clap::ValueEnum;
 use tokio_util::sync::CancellationToken;
 
 use agent_client_protocol as acp;
-use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, acp_send};
+use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
 use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
-use xai_grok_shell::sampling::error::{RATE_LIMITED_ERROR_CODE, rate_limited_user_message};
+use xai_grok_shell::sampling::error::{
+    RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
+};
 use xai_grok_shell::sampling::types::{
     REASONING_EFFORT_META_KEY, parse_canonical_effort_token, reasoning_effort_meta_value,
 };
@@ -894,7 +896,6 @@ pub async fn run_single_turn(
     agent_config.resolve_runtime_fields(&xai_grok_shell::agent::config::RuntimeResolutionContext {
         raw_config: &raw_config,
         remote_settings: None,
-        cwd: Some(&cwd),
         is_headless: true,
         // Keep the CLI override tri-state: an absent --no-subagents flag must
         // still allow GROK_SUBAGENTS/config.toml to decide the default.
@@ -1252,19 +1253,18 @@ pub async fn run_single_turn(
                 prompt_result = Some(res);
                 prompt_done_at = Some(Instant::now());
                 if !options.wait_for_background {
-                    // Drain notifications already queued ahead of the response.
-                    while let Ok(msg) = acp_rx.try_recv() {
-                        handle_headless_acp_message(
-                            msg.boxed(),
-                            &mut emitter,
-                            t_prompt,
-                            &mut ttf_logged,
-                            options.yolo,
-                            options.output_format,
-                            &mut pending_bg,
-                            &mut completed_before_bg,
-                        );
-                    }
+                    drain_acp_with_grace(
+                        &mut acp_rx,
+                        Duration::from_millis(750),
+                        &mut emitter,
+                        t_prompt,
+                        &mut ttf_logged,
+                        options.yolo,
+                        options.output_format,
+                        &mut pending_bg,
+                        &mut completed_before_bg,
+                    )
+                    .await;
                     break;
                 }
                 // With wait_for_background: keep draining ACP for task_completed.
@@ -1356,13 +1356,11 @@ pub async fn run_single_turn(
         }
         Some(Err(err)) => {
             let msg = if i32::from(err.code) == RATE_LIMITED_ERROR_CODE {
-                // The -32003 data is the flattened server message; a
-                // free-usage 429 carries the well-known code inline there.
-                if crate::app::acp_error_is_free_usage_exhausted(&err) {
-                    crate::app::FREE_USAGE_USER_MESSAGE.to_string()
-                } else {
-                    rate_limited_user_message(is_api_key_auth).to_string()
-                }
+                let detail = err.data.as_ref().and_then(error_detail_from_data);
+                crate::app::sanitize_user_error(&format_rate_limited_user_message(
+                    detail.as_deref(),
+                    is_api_key_auth,
+                ))
             } else {
                 err.to_string()
             };
@@ -1494,6 +1492,58 @@ fn track_background_lifecycle(
 }
 
 // ── ACP client message handling (select arm + pre-exit drain) ────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_acp_with_grace(
+    acp_rx: &mut AcpClientRx,
+    grace: Duration,
+    emitter: &mut HeadlessEmitter,
+    t_prompt: Instant,
+    ttf_logged: &mut bool,
+    yolo: bool,
+    output_format: OutputFormat,
+    pending_bg: &mut HashSet<String>,
+    completed_before_bg: &mut HashSet<String>,
+) {
+    let deadline = Instant::now() + grace;
+    loop {
+        while let Ok(msg) = acp_rx.try_recv() {
+            handle_headless_acp_message(
+                msg.boxed(),
+                emitter,
+                t_prompt,
+                ttf_logged,
+                yolo,
+                output_format,
+                pending_bg,
+                completed_before_bg,
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            msg = acp_rx.recv() => {
+                let Some(msg) = msg else { break; };
+                handle_headless_acp_message(
+                    msg.boxed(),
+                    emitter,
+                    t_prompt,
+                    ttf_logged,
+                    yolo,
+                    output_format,
+                    pending_bg,
+                    completed_before_bg,
+                );
+            }
+            _ = tokio::time::sleep(remaining) => {
+                break;
+            }
+        }
+    }
+}
 
 /// Process one inbound ACP client message. Used by both `acp_rx.recv()` and
 /// `try_recv()` so buffered `task_backgrounded` is not dropped when
@@ -2070,9 +2120,10 @@ mod tests {
             }),
         );
         assert!(matches!(
-            handle_ext_notification(&notif, OutputFormat::Plain),
-            ExtEvent::TaskBackgrounded { task_id, is_monitor: false } if task_id == "task-abc"
-        ));
+                    handle_ext_notification(&notif, OutputFormat::Plain),
+                    ExtEvent::TaskBackgrounded { task_id, is_monitor: false }
+        if task_id == "task-abc"
+                ));
     }
 
     #[test]
@@ -2086,9 +2137,10 @@ mod tests {
             }),
         );
         assert!(matches!(
-            handle_ext_notification(&notif, OutputFormat::Plain),
-            ExtEvent::TaskBackgrounded { task_id, is_monitor: true } if task_id == "mon-1"
-        ));
+                    handle_ext_notification(&notif, OutputFormat::Plain),
+                    ExtEvent::TaskBackgrounded { task_id, is_monitor: true }
+        if task_id == "mon-1"
+                ));
     }
 
     #[test]
@@ -2106,9 +2158,10 @@ mod tests {
             }),
         );
         assert!(matches!(
-            handle_ext_notification(&notif, OutputFormat::Plain),
-            ExtEvent::TaskCompleted { task_id } if task_id == "task-abc"
-        ));
+                    handle_ext_notification(&notif, OutputFormat::Plain),
+                    ExtEvent::TaskCompleted { task_id }
+        if task_id == "task-abc"
+                ));
     }
 
     #[test]
@@ -2125,9 +2178,10 @@ mod tests {
             }),
         );
         assert!(matches!(
-            handle_ext_notification(&spawned, OutputFormat::Plain),
-            ExtEvent::SubagentSpawned { subagent_id } if subagent_id == "sub-1"
-        ));
+                    handle_ext_notification(&spawned, OutputFormat::Plain),
+                    ExtEvent::SubagentSpawned { subagent_id }
+        if subagent_id == "sub-1"
+                ));
         let finished = make_ext_notif(
             "x.ai/session_notification",
             serde_json::json!({
@@ -2141,9 +2195,10 @@ mod tests {
             }),
         );
         assert!(matches!(
-            handle_ext_notification(&finished, OutputFormat::Plain),
-            ExtEvent::SubagentFinished { subagent_id } if subagent_id == "sub-1"
-        ));
+                    handle_ext_notification(&finished, OutputFormat::Plain),
+                    ExtEvent::SubagentFinished { subagent_id }
+        if subagent_id == "sub-1"
+                ));
     }
 
     #[test]

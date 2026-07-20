@@ -16,6 +16,13 @@ pub const API_KEY_SCOPE: &str = "xai::api_key";
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
 const BLOCKED_REASON_NO_LOGS_MODERATED: &str = "BLOCKED_REASON_NO_LOGS_MODERATED";
 
+/// Fresh-credential / missing-field default: opted out until the user or
+/// server enrichment opts in. Single source for `GrokAuth`, `AuthMeta`, and
+/// every login-path constructor so the sides cannot drift.
+pub(crate) fn default_coding_data_retention_opt_out() -> bool {
+    true
+}
+
 /// Token provenance (debugging/auth.json only -- no code branches on this).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -30,16 +37,6 @@ pub enum AuthMode {
     External,
     /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
     ApiKey,
-}
-
-impl AuthMode {
-    /// Whether this auth mode can access `supported_in_api: false` models.
-    pub fn is_session_auth(&self) -> bool {
-        match self {
-            Self::WebLogin | Self::Oidc => true,
-            Self::External | Self::ApiKey => false,
-        }
-    }
 }
 
 /// Wire value of `principal_type` for team OAuth principals (capitalized by
@@ -79,7 +76,9 @@ pub struct GrokAuth {
     pub user_blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub team_blocked_reasons: Vec<String>,
-    #[serde(default)]
+    /// Defaults to `true` (opted out) for safer consumer privacy until the
+    /// user explicitly shares or server enrichment sets the team preference.
+    #[serde(default = "default_coding_data_retention_opt_out")]
     pub coding_data_retention_opt_out: bool,
 
     /// Deprecated. Kept for deserializing existing auth.json files.
@@ -95,7 +94,10 @@ pub struct GrokAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 
-    /// OIDC issuer URL that issued this token (needed for refresh via discovery).
+    /// Issuer URL that issued this token. For OIDC credentials it drives
+    /// refresh via discovery; for external-provider credentials it is the
+    /// provider's `issuer` claim. In both modes an x.ai issuer marks the
+    /// credential first-party (`is_xai_auth`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
 
@@ -130,21 +132,41 @@ impl GrokAuth {
             .num_seconds()
     }
 
-    /// `true` when the token comes from a first-party xAI account
-    /// (OIDC login against https://auth.x.ai or the local-dev equivalent).
+    /// `true` when the token comes from a first-party xAI account —
+    /// either an OIDC login against https://auth.x.ai (or the local-dev
+    /// equivalent), or an external auth provider that declared an xAI
+    /// issuer for its token.
+    ///
+    /// The issuer is a client-side hint, not a trust assertion: everything
+    /// it unlocks still authenticates the actual token server-side, and it
+    /// never influences endpoints.
     pub fn is_xai_auth(&self) -> bool {
         match self.auth_mode {
-            AuthMode::Oidc => self
+            AuthMode::Oidc | AuthMode::External => self
                 .oidc_issuer
                 .as_deref()
                 .is_some_and(is_xai_oauth2_issuer),
-            AuthMode::External | AuthMode::ApiKey | AuthMode::WebLogin => false,
+            AuthMode::ApiKey | AuthMode::WebLogin => false,
         }
     }
 
     /// `true` when this auth can access grok.com managed MCP connectors.
     pub fn is_managed_mcp_eligible(&self) -> bool {
         self.is_xai_auth() || self.auth_mode == AuthMode::WebLogin
+    }
+
+    /// Whether this credential can access `supported_in_api: false` models.
+    ///
+    /// Session logins (WebLogin, OIDC — including enterprise issuers) always
+    /// qualify; external-provider credentials qualify only when first-party
+    /// (`is_xai_auth`), matching the built-in devbox login they replace.
+    /// Plain API keys never do.
+    pub fn is_session_auth(&self) -> bool {
+        match self.auth_mode {
+            AuthMode::WebLogin | AuthMode::Oidc => true,
+            AuthMode::External => self.is_xai_auth(),
+            AuthMode::ApiKey => false,
+        }
     }
 
     pub fn is_team_principal(&self) -> bool {
@@ -205,7 +227,7 @@ impl Default for GrokAuth {
             organization_role: None,
             user_blocked_reason: None,
             team_blocked_reasons: vec![],
-            coding_data_retention_opt_out: false,
+            coding_data_retention_opt_out: default_coding_data_retention_opt_out(),
             has_grok_code_access: None,
             refresh_token: None,
             expires_at: None,
@@ -226,6 +248,9 @@ impl GrokAuth {
         Self {
             key: "test-key".into(),
             user_id: "test-user".into(),
+            // Tests that exercise collection gates need sharing enabled by
+            // default; opt out explicitly when asserting the privacy path.
+            coding_data_retention_opt_out: false,
             ..Default::default()
         }
     }
@@ -365,6 +390,51 @@ mod tests {
     }
 
     #[test]
+    fn is_xai_auth_matrix() {
+        use crate::auth::XAI_OAUTH2_ISSUER;
+        let with_issuer = |mode: AuthMode, issuer: Option<&str>| GrokAuth {
+            oidc_issuer: issuer.map(str::to_owned),
+            ..make_auth(mode)
+        };
+
+        // Only Oidc/External qualify, and only with an x.ai issuer.
+        assert!(with_issuer(AuthMode::Oidc, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(with_issuer(AuthMode::External, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(!with_issuer(AuthMode::Oidc, None).is_xai_auth());
+        assert!(!with_issuer(AuthMode::External, None).is_xai_auth());
+        assert!(!with_issuer(AuthMode::Oidc, Some("https://idp.acme.example")).is_xai_auth());
+        assert!(!with_issuer(AuthMode::External, Some("https://idp.acme.example")).is_xai_auth());
+
+        // ApiKey / WebLogin stay false even with an x.ai issuer set.
+        assert!(!with_issuer(AuthMode::ApiKey, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+        assert!(!with_issuer(AuthMode::WebLogin, Some(XAI_OAUTH2_ISSUER)).is_xai_auth());
+    }
+
+    #[test]
+    fn is_session_auth_requires_first_party_for_external() {
+        use crate::auth::XAI_OAUTH2_ISSUER;
+        let with_issuer = |mode: AuthMode, issuer: Option<&str>| GrokAuth {
+            oidc_issuer: issuer.map(str::to_owned),
+            ..make_auth(mode)
+        };
+
+        // Session logins qualify regardless of issuer (incl. enterprise OIDC).
+        assert!(with_issuer(AuthMode::WebLogin, None).is_session_auth());
+        assert!(with_issuer(AuthMode::Oidc, None).is_session_auth());
+        assert!(with_issuer(AuthMode::Oidc, Some("https://idp.acme.example")).is_session_auth());
+
+        // External qualifies only when first-party (devbox-login parity).
+        assert!(with_issuer(AuthMode::External, Some(XAI_OAUTH2_ISSUER)).is_session_auth());
+        assert!(!with_issuer(AuthMode::External, None).is_session_auth());
+        assert!(
+            !with_issuer(AuthMode::External, Some("https://idp.acme.example")).is_session_auth()
+        );
+
+        // Plain API keys never do.
+        assert!(!with_issuer(AuthMode::ApiKey, Some(XAI_OAUTH2_ISSUER)).is_session_auth());
+    }
+
+    #[test]
     fn lookup_auth_skips_weblogin_on_primary_scope() {
         let mut map = AuthStore::new();
         map.insert("scope".into(), make_auth(AuthMode::WebLogin));
@@ -427,5 +497,24 @@ mod tests {
         let json = r#"{"userId": "u1", "subscriptionTier": ""}"#;
         let info: UserInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.subscription_tier.as_deref(), Some(""));
+    }
+
+    /// Pre-default auth.json (no coding_data_retention_opt_out key) must
+    /// deserialize as opted-out, not the old fail-open false.
+    #[test]
+    fn missing_coding_data_retention_opt_out_deserializes_opted_out() {
+        let json = r#"{
+            "key": "k",
+            "auth_mode": "oidc",
+            "create_time": "2020-01-01T00:00:00Z",
+            "user_id": "u"
+        }"#;
+        let auth: GrokAuth = serde_json::from_str(json).unwrap();
+        assert!(
+            auth.coding_data_retention_opt_out,
+            "missing field must default to opted-out"
+        );
+        assert!(default_coding_data_retention_opt_out());
+        assert!(GrokAuth::default().coding_data_retention_opt_out);
     }
 }

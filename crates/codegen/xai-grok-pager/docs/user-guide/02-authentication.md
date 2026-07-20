@@ -14,6 +14,14 @@ grok
 
 Grok stores credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
+### Credential storage
+
+Tokens in `~/.grok/auth.json` (and MCP OAuth tokens in `~/.grok/mcp_credentials.json`) are written with owner-only permissions (`0600` on Unix). Anyone with filesystem access to those paths can use the credentials, so:
+
+- Prefer full-disk encryption (FileVault, BitLocker, LUKS, or equivalent).
+- Do not copy `auth.json` or `mcp_credentials.json` into shared directories, tickets, or chat.
+- On multi-user hosts, keep `$HOME` / `$GROK_HOME` private to your account.
+
 ### Re-authenticate
 
 To switch accounts or resolve an authentication problem, run:
@@ -132,13 +140,22 @@ When browser-based login isn't possible -- for example, on sandboxed VMs, CI run
 eyJhbGciOiJSUzI1NiIs...
 ```
 
-**JSON** -- with optional refresh token and expiry:
+**JSON** -- with optional refresh token, expiry, and issuer:
 
 ```json
-{"access_token": "eyJhbGciOi...", "refresh_token": "ref-tok", "expires_in": 3600}
+{"access_token": "eyJhbGciOi...", "refresh_token": "ref-tok", "expires_in": 3600, "issuer": "https://idp.example.com"}
 ```
 
 Use JSON if your tokens expire and you want Grok to automatically re-run the binary before expiry.
+
+JSON fields:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `access_token` | yes | Bearer token Grok sends to the xAI API |
+| `refresh_token` | no | Stored for reference. Grok refreshes by re-running your binary, not with an OAuth refresh grant |
+| `expires_in` | no | Token lifetime in seconds; enables proactive refresh before expiry |
+| `issuer` | no | Identifies the token's issuer |
 
 ### Configuration
 
@@ -162,7 +179,7 @@ export GROK_AUTH_TOKEN_TTL=3600
 
 ### Token Refresh
 
-When Grok needs to refresh an expired token, it re-runs your binary with `GROK_AUTH_EXPIRED=1` set in the environment. Your binary can use this to take a faster silent-refresh path:
+When Grok needs to refresh an expired token, it re-runs your binary with `GROK_AUTH_EXPIRED=1` set in the environment. Each run fully replaces the stored credential, so emit the same JSON fields (such as `issuer`) on every invocation, including refreshes. Your binary can use this to take a faster silent-refresh path:
 
 ```bash
 #!/bin/sh
@@ -249,6 +266,25 @@ When more than one login flow is configured, Grok populates the session token fr
 3. **SpaceXAI OAuth2 browser login** -- the default
 
 During a session, the active method handles all mid-session refreshes.
+
+---
+
+## Related settings
+
+`/privacy` does not change these config knobs:
+
+| Setting | How to set it |
+|---------|---------------|
+| `[features] telemetry` | `config.toml` or `GROK_TELEMETRY_ENABLED` |
+| `[telemetry] trace_upload` | `config.toml` or `GROK_TELEMETRY_TRACE_UPLOAD` |
+| External OpenTelemetry | `GROK_EXTERNAL_OTEL` / `[telemetry] otel_*`. See [Monitoring Usage](24-monitoring-usage.md). |
+
+On team accounts, only a team admin can toggle privacy with `/privacy`.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team.
+See [How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
+When ZDR is on, `/privacy` cannot change coding-data sharing.
+
+See [Monitoring Usage](24-monitoring-usage.md#related-settings) and [Configuration](05-configuration.md#telemetry).
 
 ---
 

@@ -1,46 +1,11 @@
+use crate::auth::token_output::parse_token_output;
 use crate::auth::{AuthMode, GrokAuth};
 
-#[derive(serde::Deserialize)]
-pub(crate) struct ExternalAuthOutput {
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
-}
-
-/// Parse process output (stdout) into a `GrokAuth`. Accepts bare token or JSON.
+/// Parse stdout into a session-credential `GrokAuth`.
 pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<GrokAuth> {
-    if !output.status.success() {
-        anyhow::bail!("exited with {}", output.status);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if stdout.is_empty() {
-        anyhow::bail!("produced no output on stdout");
-    }
-
-    let (token, refresh_token, expires_at) =
-        if let Ok(parsed) = serde_json::from_str::<ExternalAuthOutput>(&stdout) {
-            tracing::debug!(
-                has_refresh_token = parsed.refresh_token.is_some(),
-                expires_in = ?parsed.expires_in,
-                "auth: parsed external provider output as JSON"
-            );
-            let expires_at = parsed
-                .expires_in
-                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-            (parsed.access_token, parsed.refresh_token, expires_at)
-        } else {
-            tracing::debug!(
-                stdout_len = stdout.len(),
-                "auth: treating output as bare token"
-            );
-            (stdout, None, None)
-        };
-
+    let parsed = parse_token_output(output)?;
     Ok(GrokAuth {
-        key: token,
+        key: parsed.access_token,
         auth_mode: AuthMode::External,
         create_time: chrono::Utc::now(),
         user_id: String::new(),
@@ -58,22 +23,27 @@ pub(crate) fn parse_output(output: &std::process::Output) -> anyhow::Result<Grok
         organization_role: None,
         user_blocked_reason: None,
         team_blocked_reasons: vec![],
-        coding_data_retention_opt_out: false,
+        coding_data_retention_opt_out: crate::auth::default_coding_data_retention_opt_out(),
         has_grok_code_access: None,
-        refresh_token,
-        expires_at,
-        oidc_issuer: None,
+        refresh_token: parsed.refresh_token,
+        expires_at: parsed.expires_at,
+        oidc_issuer: parsed.issuer,
         oidc_client_id: None,
     })
 }
 
 /// Sync version for mid-session refresh. 5s timeout for refresh, 60s for initial.
 pub(crate) fn run_external_auth_sync(command: &str, is_refresh: bool) -> Option<GrokAuth> {
+    let timeout_secs = if is_refresh { 5 } else { 60 };
+    run_auth_command(command, timeout_secs, is_refresh)
+}
+
+/// Runs `command` via `sh -c`; `mark_expired` sets `GROK_AUTH_EXPIRED=1` so the
+/// helper can distinguish re-mints from first runs.
+fn run_auth_command(command: &str, timeout_secs: u64, mark_expired: bool) -> Option<GrokAuth> {
     use std::process::{Command, Stdio};
 
-    let timeout_secs = if is_refresh { 5 } else { 60 };
-
-    tracing::info!(cmd = %command, is_refresh, timeout_secs, "auth: running external auth provider (sync)");
+    tracing::info!(cmd = %command, mark_expired, timeout_secs, "auth: running external auth provider (sync)");
 
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command])
@@ -81,7 +51,7 @@ pub(crate) fn run_external_auth_sync(command: &str, is_refresh: bool) -> Option<
         .stdout(Stdio::piped())
         // Pipe stderr — inherit would corrupt the TUI alternate screen.
         .stderr(Stdio::piped());
-    if is_refresh {
+    if mark_expired {
         cmd.env("GROK_AUTH_EXPIRED", "1");
     }
     xai_grok_tools::util::detach_std_command(&mut cmd);
@@ -170,14 +140,53 @@ mod tests {
     }
 
     #[test]
-    fn parse_output_malformed_json_falls_back_to_bare() {
+    fn parse_output_issuer_claim_enables_xai_auth() {
+        let ok = |stdout: &str| std::process::Output {
+            status: std::process::Command::new("true").status().unwrap(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: vec![],
+        };
+
+        // x.ai issuer claim → first-party session (relay-eligible).
+        let auth = parse_output(&ok(
+            r#"{"access_token":"t","expires_in":900,"issuer":"https://auth.x.ai"}"#,
+        ))
+        .unwrap();
+        assert_eq!(auth.oidc_issuer.as_deref(), Some("https://auth.x.ai"));
+        assert!(auth.is_xai_auth());
+
+        // Non-x.ai issuer is stored but stays third-party.
+        let auth = parse_output(&ok(
+            r#"{"access_token":"t","issuer":"https://idp.acme.example"}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            auth.oidc_issuer.as_deref(),
+            Some("https://idp.acme.example")
+        );
+        assert!(!auth.is_xai_auth());
+
+        // Missing / empty / whitespace issuer → None.
+        let auth = parse_output(&ok(r#"{"access_token":"t"}"#)).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+        assert!(!auth.is_xai_auth());
+        let auth = parse_output(&ok(r#"{"access_token":"t","issuer":"  "}"#)).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+
+        // Bare-token output never carries an issuer.
+        let auth = parse_output(&ok("bare-token")).unwrap();
+        assert_eq!(auth.oidc_issuer, None);
+        assert!(!auth.is_xai_auth());
+    }
+
+    #[test]
+    fn parse_output_json_shaped_but_invalid_is_err() {
         let output = std::process::Output {
             status: std::process::Command::new("true").status().unwrap(),
             stdout: b"{not valid json}".to_vec(),
             stderr: vec![],
         };
-        let auth = parse_output(&output).unwrap();
-        assert_eq!(auth.key, "{not valid json}");
+        assert!(parse_output(&output).is_err());
     }
 
     #[test]

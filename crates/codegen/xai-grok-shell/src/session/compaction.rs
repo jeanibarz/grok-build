@@ -206,6 +206,7 @@ impl SessionActor {
             &sampling_config,
             self.inference_idle_timeout,
             wall_clock_budget_secs,
+            self.compaction.tool_choice,
         )
         .await
         {
@@ -999,6 +1000,7 @@ impl SessionActor {
             sampling_config.clone(),
             self.inference_idle_timeout,
             wall_clock_budget_secs,
+            self.compaction.tool_choice,
         );
         let observer =
             crate::session::helpers::full_replace_compaction::ShellFullReplaceObserver::new(
@@ -2200,7 +2202,7 @@ mod inline_auto_compact_flow_tests {
                 cwd: cwd.as_str().to_string(),
             },
             auth_method_id: test_auth_method_id("test-auth"),
-            model_auth_facts: std::cell::RefCell::new(None),
+            model_auth_memo: std::cell::RefCell::new(None),
             attribution_callback: None,
             auth_manager: None,
             state,
@@ -2238,6 +2240,7 @@ mod inline_auto_compact_flow_tests {
                 previous_model: std::cell::Cell::new(None),
                 compaction_mode: xai_chat_state::CompactionMode::Transcript,
                 verbatim_input: true,
+                tool_choice: crate::util::config::CompactionToolChoice::Auto,
                 prefire: crate::session::compaction_config::PrefireState::default(),
                 prefix_released: std::sync::atomic::AtomicBool::new(false),
             },
@@ -2365,7 +2368,6 @@ mod inline_auto_compact_flow_tests {
             image_describe_cache: Arc::new(
                 crate::session::image_describe::ImageDescribeCache::new(),
             ),
-            subagent_spawn_info: parking_lot::Mutex::new(std::collections::HashMap::new()),
             subagent_token_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
             workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
             trace_config_template: std::cell::RefCell::new(None),

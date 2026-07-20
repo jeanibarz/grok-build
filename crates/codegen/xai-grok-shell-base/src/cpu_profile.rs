@@ -204,7 +204,7 @@ impl CpuProfileManager {
         Self::default()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn force_unsupported_for_test(&mut self) {
         self.force_unsupported = true;
     }
@@ -518,7 +518,7 @@ fn now_timestamp() -> String {
 
 // Module-level (not inside `mod tests`) so downstream crates' test targets
 // can reach it in test-only builds.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CpuProfileManager {
     pub fn start_with_engine_for_test(
         &mut self,
@@ -1003,12 +1003,13 @@ mod tests {
 
         let stop_handle = manager.take_stop_handle().unwrap();
         assert!(matches!(
-            manager.status(),
-            CpuProfileStatus::Stopping {
-                svg_path: status_path,
-                ..
-            } if status_path == svg_path
-        ));
+                    manager.status(),
+                    CpuProfileStatus::Stopping {
+                        svg_path: status_path,
+                        ..
+                    }
+        if status_path == svg_path
+                ));
 
         let err = manager
             .start_with_engine_for_test(
@@ -1136,13 +1137,14 @@ mod tests {
         let _stop_handle = manager.take_stop_handle().unwrap();
 
         assert!(matches!(
-            manager.status(),
-            CpuProfileStatus::Stopping {
-                svg_path: status_path,
-                frequency_hz: DEFAULT_FREQUENCY_HZ,
-                ..
-            } if status_path == svg_path
-        ));
+                    manager.status(),
+                    CpuProfileStatus::Stopping {
+                        svg_path: status_path,
+                        frequency_hz: DEFAULT_FREQUENCY_HZ,
+                        ..
+                    }
+        if status_path == svg_path
+                ));
     }
 
     #[test]

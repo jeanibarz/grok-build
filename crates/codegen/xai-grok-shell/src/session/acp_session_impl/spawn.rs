@@ -118,6 +118,7 @@ pub(crate) async fn spawn_session_actor(
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
+    compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
@@ -432,19 +433,18 @@ pub(crate) async fn spawn_session_actor(
         chat_state_event_tx,
         tokio_util::sync::CancellationToken::new(),
     );
-    if !initial_prompt_texts.is_empty()
+    if (!initial_prompt_texts.is_empty()
         || initial_total_tokens > 0
-        || initial_last_compaction.is_some()
+        || initial_last_compaction.is_some())
+        && let Some(mut snap) = chat_state_handle.snapshot().await
     {
-        if let Some(mut snap) = chat_state_handle.snapshot().await {
-            snap.prompt_index = initial_prompt_texts.len();
-            snap.prompt_texts = initial_prompt_texts;
-            if initial_total_tokens > 0 {
-                snap.total_tokens = initial_total_tokens;
-            }
-            snap.last_compaction_prompt_index = initial_last_compaction;
-            chat_state_handle.restore_snapshot(snap);
+        snap.prompt_index = initial_prompt_texts.len();
+        snap.prompt_texts = initial_prompt_texts;
+        if initial_total_tokens > 0 {
+            snap.total_tokens = initial_total_tokens;
         }
+        snap.last_compaction_prompt_index = initial_last_compaction;
+        chat_state_handle.restore_snapshot(snap);
     }
     chat_state_handle.update_credentials(credentials);
     let state = TokioMutex::new(State {
@@ -465,9 +465,12 @@ pub(crate) async fn spawn_session_actor(
         None => FileStateTracker::new(),
     });
     let file_state_handle = FileStateHandle::new(file_state_tracker.clone());
-    let auto_wake_delivered =
-        xai_grok_tools::reminders::task_completion::AutoWakeDeliveredIds::default();
-    tool_context.auto_wake_delivered = Some(auto_wake_delivered.clone());
+    let task_completion_reservations =
+        xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
+    let task_wake_suppressed =
+        xai_grok_tools::reminders::task_completion::TaskWakeSuppressed::default();
+    tool_context.task_completion_reservations = Some(task_completion_reservations.clone());
+    tool_context.task_wake_suppressed = Some(task_wake_suppressed.clone());
     let synthetic_trace_tx_shared: std::sync::Arc<
         std::sync::Mutex<
             Option<
@@ -523,7 +526,8 @@ pub(crate) async fn spawn_session_actor(
             current_prompt_mode: current_prompt_mode.clone(),
             turn_prompt_mode: turn_prompt_mode.clone(),
             session_cmd_tx: cmd_tx.clone(),
-            auto_wake_delivered: auto_wake_delivered.clone(),
+            task_completion_reservations: task_completion_reservations.clone(),
+            task_wake_suppressed: task_wake_suppressed.clone(),
             synthetic_trace_tx: synthetic_trace_tx_shared.clone(),
             task_output_tool_name: task_output_tool_name.clone(),
             read_tool_name: read_tool_name.clone(),
@@ -546,19 +550,46 @@ pub(crate) async fn spawn_session_actor(
             grep_ugrep,
         }
     };
+    let cursor_harness = false;
+    let terminal_backend_kind = select_terminal_backend_kind(
+        startup_hints.is_subagent,
+        parent_terminal_backend.is_some(),
+        client_terminal_capable,
+        tool_context.gateway.is_some(),
+        cursor_harness,
+    );
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
-        if let Some(parent_tb) = parent_terminal_backend.filter(|_| startup_hints.is_subagent) {
-            parent_tb
-        } else if client_terminal_capable && tool_context.gateway.is_some() {
-            std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
-                tool_context.gateway.clone().unwrap(),
-                tool_context.session_id.clone().unwrap(),
-            )) as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
-        } else {
-            let backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
-                std::sync::Arc::new(LocalTerminalBackend::new_local(resolve_search_shadows()));
-            backend
+        match terminal_backend_kind {
+            TerminalBackendKind::ReuseParent => parent_terminal_backend
+                .expect("ReuseParent is only selected when a parent backend is present"),
+            TerminalBackendKind::AcpClient => {
+                std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
+                    tool_context.gateway.clone().unwrap(),
+                    tool_context.session_id.clone().unwrap(),
+                ))
+                    as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
+            }
+            TerminalBackendKind::LocalPersistent => std::sync::Arc::new(
+                LocalTerminalBackend::new_local_with_persistent_shell(resolve_search_shadows()),
+            ),
+            TerminalBackendKind::LocalNonPersistent => {
+                let login_shell_capture = crate::util::config::resolve_login_shell_capture(
+                    remote_settings.as_ref().and_then(|r| r.login_shell_capture),
+                );
+                std::sync::Arc::new(LocalTerminalBackend::new_local_with_login_shell_capture(
+                    resolve_search_shadows(),
+                    login_shell_capture,
+                ))
+            }
         };
+    if matches!(
+        terminal_backend_kind,
+        TerminalBackendKind::LocalPersistent | TerminalBackendKind::LocalNonPersistent
+    ) {
+        terminal_backend
+            .warm_shell(tool_context.cwd.as_path())
+            .await;
+    }
     let fs_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem> =
         if client_fs_capable && tool_context.gateway.is_some() {
             std::sync::Arc::new(xai_grok_workspace::file_system::AcpFsAdapter::new(
@@ -691,6 +722,11 @@ pub(crate) async fn spawn_session_actor(
         } else {
             None
         };
+        let embed_credentials = crate::auth::credential_provider::embedding_session_credentials(
+            &embed_base_url,
+            auth_manager.as_ref(),
+            api_key_provider.clone(),
+        );
         let params = crate::session::memory::MemoryBackendParams {
             session_id: session_info.id.to_string(),
             embed_config: memory_config.as_ref().map(|mc| mc.embedding.clone()),
@@ -702,16 +738,7 @@ pub(crate) async fn spawn_session_actor(
             watcher,
             stale_claim_secs: watcher_config.stale_claim_secs,
             search_source: "tool",
-            api_key_provider: api_key_provider.clone(),
-            auth_credentials: auth_manager.as_ref().map(|am| {
-                std::sync::Arc::new(
-                    crate::auth::credential_provider::ShellAuthCredentialProvider::new(
-                        am.clone(),
-                        None,
-                        None,
-                    ),
-                ) as std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider>
-            }),
+            embedding_credentials: embed_credentials,
         };
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
             storage.clone(),
@@ -843,6 +870,11 @@ pub(crate) async fn spawn_session_actor(
         session_id_str: session_info.id.0.to_string(),
         respect_gitignore,
         path_not_found_hints,
+        scheduler_background_loops: crate::util::config::resolve_scheduler_background_loops(
+            remote_settings
+                .as_ref()
+                .and_then(|r| r.scheduler_background_loops),
+        ),
         mcp_state: mcp_state.clone(),
         managed_gateway_tool_client: managed_gateway_tool_client.clone(),
         is_non_interactive: startup_hints.non_interactive,
@@ -871,6 +903,14 @@ pub(crate) async fn spawn_session_actor(
             );
             e
         })?;
+    agent
+        .tool_bridge()
+        .update_resource(task_completion_reservations.clone())
+        .await;
+    agent
+        .tool_bridge()
+        .update_resource(task_wake_suppressed)
+        .await;
     let resolved_task_output =
         xai_grok_tools::reminders::task_completion::resolve_task_output_tool_name(
             agent.tool_bridge(),
@@ -1111,7 +1151,7 @@ pub(crate) async fn spawn_session_actor(
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
         auth_manager,
         state,
@@ -1148,6 +1188,7 @@ pub(crate) async fn spawn_session_actor(
             previous_model: std::cell::Cell::new(None),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
+            tool_choice: compaction_tool_choice,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
@@ -1308,7 +1349,6 @@ pub(crate) async fn spawn_session_actor(
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
         trace_config_template: std::cell::RefCell::new(None),
@@ -1691,6 +1731,7 @@ pub(crate) async fn spawn_session_on_thread(
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
+    compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
@@ -1853,6 +1894,7 @@ pub(crate) async fn spawn_session_on_thread(
                         system_prompt_label,
                         compaction_mode,
                         compaction_verbatim_input,
+                        compaction_tool_choice,
                         two_pass_enabled,
                         buffering_settings,
                         origin_client,
@@ -2020,5 +2062,80 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .end_restart(server);
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalBackendKind {
+    ReuseParent,
+    AcpClient,
+    LocalPersistent,
+    LocalNonPersistent,
+}
+fn select_terminal_backend_kind(
+    is_subagent: bool,
+    has_parent_backend: bool,
+    client_terminal_capable: bool,
+    has_gateway: bool,
+    cursor_harness: bool,
+) -> TerminalBackendKind {
+    if is_subagent && has_parent_backend {
+        TerminalBackendKind::ReuseParent
+    } else if client_terminal_capable && has_gateway {
+        TerminalBackendKind::AcpClient
+    } else if cursor_harness {
+        TerminalBackendKind::LocalPersistent
+    } else {
+        TerminalBackendKind::LocalNonPersistent
+    }
+}
+#[cfg(test)]
+mod terminal_backend_select_tests {
+    use super::{TerminalBackendKind, select_terminal_backend_kind};
+    #[test]
+    fn subagent_with_parent_reuses_parent() {
+        assert_eq!(
+            select_terminal_backend_kind(true, true, true, true, true),
+            TerminalBackendKind::ReuseParent
+        );
+    }
+    #[test]
+    fn subagent_without_parent_falls_through() {
+        assert_eq!(
+            select_terminal_backend_kind(true, false, true, true, true),
+            TerminalBackendKind::AcpClient
+        );
+        assert_eq!(
+            select_terminal_backend_kind(true, false, false, true, true),
+            TerminalBackendKind::LocalPersistent
+        );
+    }
+    #[test]
+    fn non_subagent_never_reuses_parent() {
+        assert_eq!(
+            select_terminal_backend_kind(false, true, false, false, true),
+            TerminalBackendKind::LocalPersistent
+        );
+    }
+    #[test]
+    fn client_terminal_uses_acp_only_with_gateway() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, true, true, true),
+            TerminalBackendKind::AcpClient
+        );
+        assert_eq!(
+            select_terminal_backend_kind(false, false, true, false, true),
+            TerminalBackendKind::LocalPersistent
+        );
+    }
+    #[test]
+    fn local_session_cursor_harness_selects_persistent_backend() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, true),
+            TerminalBackendKind::LocalPersistent
+        );
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, false),
+            TerminalBackendKind::LocalNonPersistent
+        );
     }
 }

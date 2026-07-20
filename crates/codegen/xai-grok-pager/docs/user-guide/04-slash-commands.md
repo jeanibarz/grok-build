@@ -77,11 +77,14 @@ Rewind the conversation to an earlier turn, discarding everything after it.
 
 ### `/copy`
 
-Copy the most recent response to the clipboard. Pass a number to copy the Nth-latest response.
+Copy the most recent response to the clipboard. Pass a number to copy the Nth-latest response. Pass a file path to write instead of using the clipboard (useful over SSH when the local clipboard is unreachable).
+Every copy is also written to a backup file (`~/.grok/last-copy.txt` by default, or `GROK_COPY_FILE` if set), and the toast names that path so you always know where to retrieve the text — including when the clipboard cannot be reached (for example Apple Terminal over SSH) or the copy went out as an OSC 52 escape that this terminal couldn't be verified to apply.
 
 ```
 /copy
 /copy 2
+/copy out.txt
+/copy 2 ~/exports/last-reply.md
 ```
 
 ### `/export`
@@ -211,10 +214,12 @@ prompt and type the character. Persists to `[ui].vim_mode` in `config.toml`.
 Reopen the current session in the other render mode. `/minimal` (offered in
 fullscreen) switches to the experimental scrollback-native mode; `/fullscreen`
 (offered in minimal; alias `/full`) switches back to the standard alt-screen
-TUI. Both relaunch the pager on the same conversation and are **sticky**: the
-choice persists to `[ui].screen_mode` in `config.toml`, so future plain `grok`
-launches open in whatever mode was last used. The `--minimal` / `--fullscreen`
-CLI flags do the same thing at launch time.
+TUI. Both relaunch the pager on the same conversation for this session only —
+they do not write `config.toml`. Descriptions and the relaunch banner tell you
+how to switch back (`/fullscreen` ⇄ `/minimal`). The `--minimal` /
+`--fullscreen` CLI flags are likewise session-scoped. To make plain `grok` open
+in a given mode by default, use `/settings` → **Default screen mode**, or set
+`[ui] screen_mode` in `config.toml`.
 
 ```
 /minimal
@@ -397,7 +402,11 @@ Report an issue or send feedback.
 
 ### `/btw`
 
-Send an aside to the agent without interrupting the current task.
+Send an aside to the agent without interrupting the current task. In minimal
+mode (`--minimal`), the answer appears in a dismissible panel above the prompt.
+**Esc** dismisses the panel; a finished answer is saved into native scrollback,
+while a late response to a dismissed loading panel is dropped. Side Q/A is not
+part of the main turn.
 
 ```
 /btw also check the error handling
@@ -511,7 +520,15 @@ Show or toggle privacy and data-retention status.
 
 ```
 /privacy
+/privacy opt-in
+/privacy opt-out
 ```
+
+Does not change `[features] telemetry`, `trace_upload`, or external OTEL settings.
+See [Monitoring Usage](24-monitoring-usage.md#related-settings).
+On team accounts, only a team admin can toggle privacy with `/privacy`.
+Team admins can also enable or disable Zero Data Retention (ZDR) for their team:
+[How to enable ZDR](https://docs.x.ai/developers/faq/security#how-to-enable-zdr).
 
 ---
 

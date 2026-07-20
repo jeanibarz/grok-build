@@ -16,9 +16,8 @@ use crate::deny::{
 };
 use crate::paths::grok_home;
 #[cfg(all(feature = "enforce", unix))]
-use crate::paths::{
-    DEVICE_DIRS, DEVICE_FILES, essential_writable_paths, essential_writable_paths_minimal,
-};
+use crate::paths::{DEVICE_DIRS, DEVICE_FILES};
+use crate::paths::{essential_writable_paths, essential_writable_paths_minimal};
 
 /// A resolved sandbox profile ready to be converted to a `CapabilitySet`.
 #[derive(Debug, Clone)]
@@ -69,21 +68,8 @@ pub enum ProfileName {
 }
 
 impl ProfileName {
-    pub fn restricts_network(&self) -> bool {
+    pub(crate) fn restricts_network(&self) -> bool {
         matches!(self, Self::ReadOnly | Self::Strict)
-    }
-
-    /// Resolve network restriction from config (handles Custom profiles).
-    pub fn restricts_network_resolved(&self, config: &SandboxConfig) -> bool {
-        match self {
-            Self::ReadOnly | Self::Strict => true,
-            Self::Workspace | Self::Devbox | Self::Off => false,
-            Self::Custom(name) => config
-                .profiles
-                .get(name)
-                .and_then(|p| p.restrict_network)
-                .unwrap_or(false),
-        }
     }
 }
 
@@ -140,18 +126,11 @@ pub fn load_sandbox_config(workspace: &Path) -> SandboxConfig {
     config
 }
 
-/// Warn when project config attempts to redefine a user-defined custom profile.
-/// Called once during process startup, separately from config loading because the
-/// enforcement path reads the merged config more than once.
-pub fn warn_sandbox_profile_conflicts(workspace: &Path) {
-    let global_path = grok_home().join("sandbox.toml");
-    let project_path = workspace.join(".grok").join("sandbox.toml");
-    let global = load_config_file(&global_path).unwrap_or_default();
-    let project = load_config_file(&project_path).unwrap_or_default();
-
-    for name in mismatched_profile_names(&global, &project) {
-        warn_profile_conflict(&name, &global_path, &project_path);
-    }
+pub fn sandbox_profile_conflicts(workspace: &Path) -> Vec<String> {
+    let global = load_config_file(&grok_home().join("sandbox.toml")).unwrap_or_default();
+    let project =
+        load_config_file(&workspace.join(".grok").join("sandbox.toml")).unwrap_or_default();
+    mismatched_profile_names(&global, &project)
 }
 
 fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> Vec<String> {
@@ -169,14 +148,6 @@ fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> 
         .collect();
     names.sort_unstable();
     names
-}
-
-fn warn_profile_conflict(name: &str, global_path: &Path, project_path: &Path) {
-    eprintln!(
-        "warning: project sandbox profile '{name}' in '{}' conflicts with a different user profile in '{}'; the project definition is ignored",
-        project_path.display(),
-        global_path.display()
-    );
 }
 
 /// Merge project profiles into `config`. Names already defined globally are
@@ -198,9 +169,9 @@ fn load_config_file(path: &Path) -> Option<SandboxConfig> {
     }
 }
 
-#[cfg(all(feature = "enforce", unix))]
 impl ProfileName {
     /// Convert this profile into a nono `CapabilitySet` for the given workspace.
+    #[cfg(all(feature = "enforce", unix))]
     pub fn to_capability_set(&self, workspace: &Path) -> anyhow::Result<CapabilitySet> {
         let config = load_sandbox_config(workspace);
         self.to_capability_set_with_config(workspace, &config)
@@ -210,6 +181,7 @@ impl ProfileName {
     ///
     /// A custom profile's own `deny` list is kernel-enforced (read + write/rename)
     /// on top of the base profile.
+    #[cfg(all(feature = "enforce", unix))]
     pub fn to_capability_set_with_config(
         &self,
         workspace: &Path,
@@ -219,10 +191,15 @@ impl ProfileName {
             return Ok(CapabilitySet::new());
         }
 
-        // Resolve to a SandboxProfile
-        let profile = self.resolve(workspace, config)?;
+        let profile = self.resolve_profile(workspace, config)?;
+        Self::capability_set_from_profile(workspace, &profile)
+    }
 
-        // Build CapabilitySet from the resolved profile
+    #[cfg(all(feature = "enforce", unix))]
+    pub(crate) fn capability_set_from_profile(
+        workspace: &Path,
+        profile: &SandboxProfile,
+    ) -> anyhow::Result<CapabilitySet> {
         let mut caps = CapabilitySet::new();
 
         // Default read access
@@ -525,12 +502,83 @@ mod tests {
     }
 
     #[test]
-    fn network_restriction() {
-        assert!(!ProfileName::Workspace.restricts_network());
-        assert!(!ProfileName::Devbox.restricts_network());
-        assert!(ProfileName::ReadOnly.restricts_network());
-        assert!(ProfileName::Strict.restricts_network());
-        assert!(!ProfileName::Off.restricts_network());
+    fn built_in_network_restriction_values() {
+        let workspace = std::env::current_dir().unwrap();
+        let config = SandboxConfig::default();
+
+        for (name, expected) in [
+            (ProfileName::Workspace, false),
+            (ProfileName::Devbox, false),
+            (ProfileName::ReadOnly, true),
+            (ProfileName::Strict, true),
+        ] {
+            let resolved = name.resolve_profile(&workspace, &config).unwrap();
+            assert_eq!(resolved.restrict_network, expected, "{name}");
+        }
+    }
+
+    fn network_inheritance_config() -> SandboxConfig {
+        SandboxConfig {
+            profiles: HashMap::from([
+                (
+                    "strict-inherited".to_string(),
+                    ProfileConfig {
+                        extends: Some("strict".to_string()),
+                        restrict_network: None,
+                        read_only: vec![],
+                        read_write: vec![],
+                        deny: vec![],
+                    },
+                ),
+                (
+                    "read-only-inherited".to_string(),
+                    ProfileConfig {
+                        extends: Some("read-only".to_string()),
+                        restrict_network: None,
+                        read_only: vec![],
+                        read_write: vec![],
+                        deny: vec![],
+                    },
+                ),
+                (
+                    "strict-unrestricted".to_string(),
+                    ProfileConfig {
+                        extends: Some("strict".to_string()),
+                        restrict_network: Some(false),
+                        read_only: vec![],
+                        read_write: vec![],
+                        deny: vec![],
+                    },
+                ),
+                (
+                    "workspace-restricted".to_string(),
+                    ProfileConfig {
+                        extends: Some("workspace".to_string()),
+                        restrict_network: Some(true),
+                        read_only: vec![],
+                        read_write: vec![],
+                        deny: vec![],
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn custom_network_restriction_inherits_and_overrides_base() {
+        let workspace = std::env::current_dir().unwrap();
+        let config = network_inheritance_config();
+
+        for (name, expected) in [
+            ("strict-inherited", true),
+            ("read-only-inherited", true),
+            ("strict-unrestricted", false),
+            ("workspace-restricted", true),
+        ] {
+            let profile_name = ProfileName::Custom(name.to_string());
+            let resolved = profile_name.resolve_profile(&workspace, &config).unwrap();
+            assert_eq!(resolved.restrict_network, expected, "{name}");
+        }
     }
 
     #[test]
@@ -632,50 +680,30 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_profile_names_only_reports_different_conflicts() {
-        let global: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
+    fn mismatched_profile_names_reports_only_changed_custom_profiles() {
+        let profile = |restrict_network| ProfileConfig {
+            extends: Some("workspace".to_string()),
+            restrict_network: Some(restrict_network),
+            read_only: vec![],
+            read_write: vec![],
+            deny: vec![],
+        };
+        let global = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(false)),
+                ("same".to_string(), profile(false)),
+            ]),
+        };
+        let project = SandboxConfig {
+            profiles: HashMap::from([
+                ("dev".to_string(), profile(true)),
+                ("same".to_string(), profile(false)),
+                ("project-only".to_string(), profile(true)),
+                ("devbox".to_string(), profile(true)),
+            ]),
+        };
 
-[profiles.changed]
-extends = "workspace"
-restrict_network = false
-
-[profiles.user_only]
-extends = "strict"
-
-[profiles.devbox]
-extends = "workspace"
-restrict_network = false
-"#,
-        )
-        .unwrap();
-        let project: SandboxConfig = toml::from_str(
-            r#"
-[profiles.same]
-extends = "workspace"
-restrict_network = false
-
-[profiles.changed]
-extends = "workspace"
-restrict_network = true
-
-[profiles.project_only]
-extends = "devbox"
-
-[profiles.devbox]
-extends = "strict"
-restrict_network = true
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            mismatched_profile_names(&global, &project),
-            vec!["changed".to_string()]
-        );
+        assert_eq!(mismatched_profile_names(&global, &project), vec!["dev"]);
     }
 
     #[test]

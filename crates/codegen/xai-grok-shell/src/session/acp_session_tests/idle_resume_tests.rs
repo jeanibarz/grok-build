@@ -127,7 +127,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 },
                 attribution_callback: None,
                 auth_method_id: test_auth_method_id("cached_token"),
-                model_auth_facts: std::cell::RefCell::new(None),
+                model_auth_memo: std::cell::RefCell::new(None),
                 auth_manager: {
                     let dir = tempfile::tempdir().unwrap();
                     let mgr = std::sync::Arc::new(crate::auth::AuthManager::new(
@@ -181,6 +181,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
+                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                 },
@@ -303,7 +304,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),
-                subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
                 subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
                 workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
                 trace_config_template: std::cell::RefCell::new(None),

@@ -1,5 +1,31 @@
 //! Tests for the action router, model switching, slash commands, and other cross-cutting dispatch behavior.
 use super::*;
+#[test]
+fn auth_copy_dispatch_preserves_all_delivery_states() {
+    for delivery in [
+        crate::clipboard::ClipboardDelivery::Confirmed,
+        crate::clipboard::ClipboardDelivery::Unverified,
+        crate::clipboard::ClipboardDelivery::Failed,
+    ] {
+        let mut app = test_app();
+        app.auth_state = AuthState::Authenticating {
+            request_seq: 1,
+            handle: None,
+            auth_url: Some("https://grok.com/auth".to_owned()),
+            mode: AuthMode::Command,
+        };
+        let effects = crate::app::dispatch::router::dispatch_copy_auth_url(&mut app, |url| {
+            assert_eq!(url, "https://grok.com/auth");
+            delivery
+        });
+        assert_eq!(app.auth_clipboard_delivery, Some(delivery));
+        assert_eq!(app.auth_clipboard_feedback_generation, 1);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::ScheduleClearAuthCopyFeedback { generation: 1 }]
+        ));
+    }
+}
 fn seed_foreign_resume_hint(
     app: &mut AppView,
     tool: xai_grok_workspace::foreign_sessions::ForeignSessionTool,
@@ -479,7 +505,8 @@ fn dispatch_send_prompt_announcements_via_registry() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::PersistAnnouncementsHidden {
-        hidden_ids } if hidden_ids.contains("crit-a"))),
+        hidden_ids }
+if hidden_ids.contains("crit-a"))),
         "expected persist effect carrying the hidden id, got {effects:?}"
     );
     assert!(app.hidden_announcement_ids.contains("crit-a"));
@@ -543,7 +570,8 @@ fn announcements_show_clears_visible_critical_ids_only() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::PersistAnnouncementsHidden {
-        hidden_ids } if ! hidden_ids.contains("outage-a"))),
+        hidden_ids }
+if ! hidden_ids.contains("outage-a"))),
         "expected persist effect without the un-hidden id, got {effects:?}"
     );
     assert_eq!(shown_banner_id(&app).as_deref(), Some("outage-a"));
@@ -635,7 +663,8 @@ fn announcements_show_clears_hidden_promo_ids() {
         effects
             .iter()
             .any(|e| matches!(e, Effect::PersistAnnouncementsHidden {
-        hidden_ids } if ! hidden_ids.contains("promo-a"))),
+        hidden_ids }
+if ! hidden_ids.contains("promo-a"))),
         "expected persist effect without the un-hidden promo id, got {effects:?}"
     );
     assert_eq!(shown_banner_id(&app).as_deref(), Some("promo-a"));
@@ -659,7 +688,8 @@ fn switch_model_dispatch_produces_effect_and_sets_pending() {
     );
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. } if mid == &
+        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. }
+if mid == &
         model_id)
     );
     assert!(app.agents[&id].session.model_switch_pending);
@@ -680,7 +710,8 @@ fn switch_model_allowed_when_agent_chat_kind() {
     );
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. } if mid == &
+        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. }
+if mid == &
         model_id)
     );
     assert!(app.agents[&id].session.model_switch_pending);
@@ -700,7 +731,8 @@ fn switch_model_allowed_when_app_chat_mode() {
     );
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. } if mid == &
+        matches!(& effects[0], Effect::SwitchModel { model_id : mid, .. }
+if mid == &
         model_id)
     );
     assert!(app.agents[&id].session.model_switch_pending);
@@ -920,7 +952,8 @@ fn acp_bootstrap_command_executes_as_passthrough() {
     let effects = dispatch(Action::SendPrompt("/flush".into()), &mut app);
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SendPrompt { text, .. } if text == "/flush"),
+        matches!(& effects[0], Effect::SendPrompt { text, .. }
+if text == "/flush"),
         "ACP command should passthrough, got: {effects:?}"
     );
 }
@@ -1055,7 +1088,8 @@ fn acp_command_with_args_passthrough_includes_args() {
     let effects = dispatch(Action::SendPrompt("/search find bugs".into()), &mut app);
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::SendPrompt { text, .. } if text ==
+        matches!(& effects[0], Effect::SendPrompt { text, .. }
+if text ==
         "/search find bugs"),
         "ACP passthrough should preserve args, got: {effects:?}"
     );
@@ -1298,7 +1332,8 @@ fn view_catalog_entry_emits_fetch_effect() {
     );
     assert_eq!(effects.len(), 1);
     assert!(
-        matches!(& effects[0], Effect::FetchCatalogEntry { kind, name } if kind ==
+        matches!(& effects[0], Effect::FetchCatalogEntry { kind, name }
+if kind ==
         "persona" && name == "researcher")
     );
 }
@@ -1759,6 +1794,7 @@ fn show_tasks_lists_a_scheduled_task() {
                 created_at: std::time::Instant::now(),
                 next_fire_at: None,
                 tag: "loop".to_string(),
+                last_subagent_id: None,
             },
         );
     }
@@ -2104,8 +2140,6 @@ fn mouse_click_on_peek_close_rect_clears_peek() {
             time_ago: String::new(),
             response_type: "Idle".into(),
             last_user_message: None,
-            last_agent_lines: Vec::new(),
-            last_response_truncated: false,
             question: None,
             options: Vec::new(),
             request_id: None,

@@ -216,8 +216,9 @@ impl MemoryConfig {
 /// Configuration for subagent (task tool) support.
 ///
 /// Parsed from the `[subagents]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Enabled by default; the CLI override, `GROK_SUBAGENTS=0`
-/// env var, or `[subagents] enabled = false` in config.toml can disable it.
+/// `.grok/config.toml`. Enabled by default; can be disabled via
+/// `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false`
+/// in config.toml.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SubagentsConfig {
@@ -443,12 +444,22 @@ impl SubagentsConfig {
     /// intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes
     /// the default.
     ///
-    /// When `cwd` is provided, file-based roles are discovered from
-    /// `{cwd}/.grok/roles/*.toml` and merged (inline config takes precedence).
-    pub fn resolve(
+    /// Project files are excluded from this trust-independent base; Task
+    /// boundaries overlay them using the parent cwd's authoritative trust verdict.
+    pub fn resolve(cli_flag: Option<bool>, config: &toml::Value) -> Self {
+        let user_grok_root = xai_grok_config::user_grok_home();
+        Self::resolve_base_with_sources(
+            cli_flag,
+            config,
+            user_grok_root.as_deref(),
+            &bundle::bundled_root(),
+        )
+    }
+    pub(crate) fn resolve_base_with_sources(
         cli_flag: Option<bool>,
         config: &toml::Value,
-        cwd: Option<&std::path::Path>,
+        user_grok_root: Option<&std::path::Path>,
+        bundled_root: &std::path::Path,
     ) -> Self {
         let mut result: Self = config
             .get("subagents")
@@ -463,18 +474,39 @@ impl SubagentsConfig {
             true,
         );
         result.enabled = resolved.value;
-        if let Some(cwd) = cwd {
-            result.discover_roles(cwd);
-            result.discover_personas(cwd);
+        if let Some(root) = user_grok_root {
+            result.discover_roles_in_dir(&root.join("roles"));
+            result.discover_personas_in_dir(&root.join("personas"));
         }
-        if let Some(home) = dirs::home_dir() {
-            result.discover_roles(&home);
-            result.discover_personas(&home);
-        }
-        let bundled_root = bundle::bundled_root();
         result.discover_roles_in_dir(&bundled_root.join("roles"));
         result.discover_personas_in_dir(&bundled_root.join("personas"));
         result
+    }
+    pub(crate) fn effective_definition_maps(
+        roles: &std::collections::HashMap<String, SubagentRole>,
+        personas: &std::collections::HashMap<String, SubagentPersona>,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> (
+        std::collections::HashMap<String, SubagentRole>,
+        std::collections::HashMap<String, SubagentPersona>,
+    ) {
+        let mut project = Self::default();
+        if project_trusted {
+            project.discover_roles(cwd);
+            project.discover_personas(cwd);
+        }
+        for (name, role) in roles {
+            if role.source_dir.is_none() || !project.roles.contains_key(name) {
+                project.roles.insert(name.clone(), role.clone());
+            }
+        }
+        for (name, persona) in personas {
+            if persona.source_path.is_none() || !project.personas.contains_key(name) {
+                project.personas.insert(name.clone(), persona.clone());
+            }
+        }
+        (project.roles, project.personas)
     }
 }
 /// Managed MCP connector fetching config (`[managed_mcps]` in config.toml).
@@ -820,12 +852,12 @@ impl StorageMode {
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
     MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
-    claude_managed_settings_probe_path, fail_closed_flag_from_str,
+    claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
     is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
     load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
-    load_toml_file, managed_config_identity_changed, managed_deployment_id,
-    managed_policy_compromised_for, mark_managed_config_synced, requirements_layers,
-    system_config_dir, user_grok_home,
+    load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
+    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
+    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub fn config_origins(
@@ -1064,6 +1096,7 @@ fn apply_requirements_inner(
     pin_requirement_only!(image_edit);
     pin_feature!(video_gen);
     pin_feature!(write_file);
+    pin_feature!(voice_mode);
     pin_requirement_only!(remote_fetch);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
@@ -1313,7 +1346,6 @@ pub fn apply_sandbox(
             None => {}
         }
     }
-    xai_grok_sandbox::warn_sandbox_profile_conflicts(&workspace);
     if sandbox_profile != xai_grok_sandbox::ProfileName::Off {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let is_custom = matches!(sandbox_profile, xai_grok_sandbox::ProfileName::Custom(_));

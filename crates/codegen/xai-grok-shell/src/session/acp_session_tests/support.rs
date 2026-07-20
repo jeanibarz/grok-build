@@ -159,7 +159,12 @@ pub(crate) async fn create_test_actor_ex(
         xai_hunk_tracker::TrackingMode::AgentOnly,
         tokio_util::sync::CancellationToken::new(),
     );
-    let tool_context = ToolContext::new(cwd.clone(), None, None, fs, terminal, hunk_tracker_handle);
+    let mut tool_context =
+        ToolContext::new(cwd.clone(), None, None, fs, terminal, hunk_tracker_handle);
+    tool_context.task_completion_reservations =
+        Some(xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default());
+    tool_context.task_wake_suppressed =
+        Some(xai_grok_tools::reminders::task_completion::TaskWakeSuppressed::default());
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
@@ -197,7 +202,7 @@ pub(crate) async fn create_test_actor_ex(
             cwd: cwd.as_str().to_string(),
         },
         auth_method_id: test_auth_method_id("test-auth"),
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
         state,
@@ -235,6 +240,7 @@ pub(crate) async fn create_test_actor_ex(
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
+            tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
         },
@@ -353,11 +359,26 @@ pub(crate) async fn create_test_actor_ex(
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
-        subagent_spawn_info: parking_lot::Mutex::new(HashMap::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         trace_config_template: std::cell::RefCell::new(None),
     };
+    if let Some(reservations) = actor.tool_context.task_completion_reservations.clone() {
+        actor
+            .agent
+            .borrow()
+            .tool_bridge()
+            .update_resource(reservations)
+            .await;
+    }
+    if let Some(gate) = actor.tool_context.task_wake_suppressed.clone() {
+        actor
+            .agent
+            .borrow()
+            .tool_bridge()
+            .update_resource(gate)
+            .await;
+    }
     (actor, event_rx)
 }
 #[cfg(test)]
@@ -399,6 +420,7 @@ pub(crate) fn user_item_with_rx(
         verbatim: false,
         json_schema: None,
         origin: crate::session::PromptOrigin::User,
+        task_wake_fallback: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,
@@ -438,6 +460,7 @@ pub(crate) fn input_with_origin_rx(
         verbatim,
         json_schema: None,
         origin,
+        task_wake_fallback: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,

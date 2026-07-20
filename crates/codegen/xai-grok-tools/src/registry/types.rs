@@ -1414,6 +1414,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(parent_ctx.call_id.clone());
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = parent_ctx.extensions.get::<xai_tool_runtime::Cwd>() {
             ctx.extensions.insert((*cwd).clone());
         }
@@ -1542,6 +1545,9 @@ impl FinalizedToolset {
         let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         ctx.extensions.insert(self.resources.clone());
         ctx.extensions.insert_arc(Arc::clone(&self.renderer));
+        ctx.extensions.insert(
+            crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
+        );
         if let Some(cwd) = cwd_override {
             ctx.extensions.insert(xai_tool_runtime::Cwd(cwd));
         }
@@ -2158,12 +2164,12 @@ mod tests {
     #[tokio::test]
     async fn full_toolset_descriptions_render_cleanly() {
         use crate::implementations::grok_build::{
-            DEPLOY_APP_TOOL_NAME, IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME,
-            REFERENCE_TO_VIDEO_TOOL_NAME, SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
+            IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME, REFERENCE_TO_VIDEO_TOOL_NAME,
+            SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
         };
         let builder = ToolRegistryBuilder::new();
         let config = ToolServerConfig {
-            tools: vec![
+            tools: [
                 "read_file",
                 "search_replace",
                 "run_terminal_cmd",
@@ -2180,7 +2186,6 @@ mod tests {
                 "web_fetch",
                 "lsp",
                 IMAGE_GEN_TOOL_NAME,
-                DEPLOY_APP_TOOL_NAME,
                 IMAGE_TO_VIDEO_TOOL_NAME,
                 REFERENCE_TO_VIDEO_TOOL_NAME,
                 "monitor",
@@ -2190,6 +2195,7 @@ mod tests {
             ]
             .into_iter()
             .map(|id| ToolConfig::from_id(format!("GrokBuild:{id}")))
+            .chain(std::iter::empty::<ToolConfig>())
             .collect(),
             behavior_preset: None,
         };

@@ -138,34 +138,9 @@ mod feedback_tests {
             } else {
                 Some("could be better".into())
             },
-            feedback_categories: vec![],
-            message_id: None,
             model_id: Some("grok-3-fast".into()),
             resolved_model_id: Some("grok-4.5".into()),
-            model_fingerprint: None,
-            context_type: None,
-            feature_name: None,
-            tool_name: None,
-            experiment_id: None,
-            comparison_id: None,
-            preferred_model_id: None,
-            preference_strength: None,
-            preference_reasons: vec![],
-            request_id: None,
-            client_version: None,
-            shell_version: None,
-            extension_host: None,
-            metadata: None,
-            last_user_message: None,
-            last_assistant_message: None,
-            tool_outcomes: vec![],
-            session_cwd: None,
-            compaction_count: None,
-            context_window_usage: None,
-            context_tokens_used: None,
-            context_window_tokens: None,
-            terminal_info: None,
-            unified_log_url: None,
+            ..Default::default()
         }
     }
 
@@ -306,6 +281,11 @@ pub struct SessionStateCopy {
 pub enum PersistenceMsg {
     /// A session update (ACP update or xAI extension update)
     Update(SessionUpdate),
+    AppendUpdateDurablyAndAck {
+        update: SessionUpdate,
+        respond_to:
+            tokio::sync::oneshot::Sender<Result<(), crate::session::storage::AppendUpdateError>>,
+    },
     ContentChunk(PersistenceContentChunk),
     Chat(ConversationItem),
     /// Replace the entire chat history (used for compaction)
@@ -1365,25 +1345,88 @@ mod generated_title_tests {
 
 pub struct PersistenceHandle {
     pub tx: mpsc::UnboundedSender<PersistenceMsg>,
-    /// Explicit flag set only by [`Self::noop`]. Do not treat a closed sender
-    /// alone as noop — a real persistence actor may exit and drop its receiver.
     noop: bool,
 }
 
+#[derive(Debug)]
+pub enum DurableAppendError {
+    NotCommitted(io::Error),
+    Committed(io::Error),
+    AcknowledgementLost(io::Error),
+}
+
+impl std::fmt::Display for DurableAppendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error)
+            | Self::Committed(error)
+            | Self::AcknowledgementLost(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DurableAppendError {}
+
+impl From<crate::session::storage::AppendUpdateError> for DurableAppendError {
+    fn from(error: crate::session::storage::AppendUpdateError) -> Self {
+        use crate::session::storage::AppendUpdateError;
+        match error {
+            AppendUpdateError::NotCommitted(error) => Self::NotCommitted(error),
+            AppendUpdateError::Committed(error) => Self::Committed(error),
+        }
+    }
+}
+
 impl PersistenceHandle {
-    /// Create a no-op persistence handle that silently discards all messages.
-    ///
-    /// Used for subagent child sessions that don't need disk persistence
-    /// (their results are captured by the parent via the oneshot channel).
     pub fn noop() -> Self {
         let (tx, _rx) = mpsc::unbounded_channel();
         Self { tx, noop: true }
     }
 
-    /// `true` only for handles created via [`Self::noop`].
     pub fn is_noop(&self) -> bool {
         self.noop
     }
+
+    /// Append after older buffered updates and wait for the durable barrier.
+    ///
+    /// [`DurableAppendError::NotCommitted`] is safe to retry; [`DurableAppendError::Committed`]
+    /// means the replay line landed; [`DurableAppendError::AcknowledgementLost`] has unknown status.
+    /// No-op handles return `Unsupported`.
+    pub async fn append_update_durably(
+        &self,
+        update: SessionUpdate,
+    ) -> Result<(), DurableAppendError> {
+        if self.noop {
+            return Err(DurableAppendError::NotCommitted(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "durable session update append is unsupported by a no-op persistence handle",
+            )));
+        }
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to })
+            .map_err(|_| {
+                DurableAppendError::NotCommitted(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "session persistence actor stopped before durable append dispatch",
+                ))
+            })?;
+        response
+            .await
+            .map_err(|_| {
+                DurableAppendError::AcknowledgementLost(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "session persistence actor stopped before durable append acknowledgement",
+                ))
+            })?
+            .map_err(DurableAppendError::from)
+    }
+}
+
+enum PendingAppendOutcome {
+    CommittedOk(acp::SessionNotification),
+    CommittedErr(acp::SessionNotification, io::Error),
+    NotCommittedErr(acp::SessionNotification, io::Error),
 }
 
 struct SessionPersistence {
@@ -1494,32 +1537,92 @@ impl SessionPersistence {
         }
     }
 
-    async fn write_update(&mut self, update: &SessionUpdate) {
-        if let Err(e) = self.storage.append_update(&self.info, update).await {
-            tracing::warn!(?e, "failed to write update");
+    async fn write_update(
+        &self,
+        update: &SessionUpdate,
+    ) -> Result<(), crate::session::storage::AppendUpdateError> {
+        self.storage
+            .append_update_commit_aware(&self.info, update)
+            .await
+    }
+
+    fn queue_acp_sync(&self, notification: acp::SessionNotification) {
+        if let Some(sync) = &self.remote_sync {
+            sync.queue(notification.clone());
         }
+        if let Some(relay) = &self.relay_sync {
+            relay.queue(notification);
+        }
+    }
+
+    fn finish_pending_append(
+        notification: acp::SessionNotification,
+        result: Result<(), crate::session::storage::AppendUpdateError>,
+    ) -> PendingAppendOutcome {
+        match result {
+            Ok(()) => PendingAppendOutcome::CommittedOk(notification),
+            Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                PendingAppendOutcome::NotCommittedErr(notification, error)
+            }
+            Err(crate::session::storage::AppendUpdateError::Committed(error)) => {
+                PendingAppendOutcome::CommittedErr(notification, error)
+            }
+        }
+    }
+
+    /// Restore uncommitted failures; sync committed records before returning errors.
+    async fn drain_pending(&mut self) -> Result<(), crate::session::storage::AppendUpdateError> {
+        if let Some(notification) = self.pending_notification.take() {
+            let result = self
+                .write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
+                .await;
+            match Self::finish_pending_append(notification, result) {
+                PendingAppendOutcome::CommittedOk(notification) => {
+                    self.queue_acp_sync(notification);
+                }
+                PendingAppendOutcome::CommittedErr(notification, error) => {
+                    self.queue_acp_sync(notification);
+                    return Err(crate::session::storage::AppendUpdateError::Committed(error));
+                }
+                PendingAppendOutcome::NotCommittedErr(notification, error) => {
+                    self.pending_notification = Some(notification);
+                    return Err(crate::session::storage::AppendUpdateError::NotCommitted(
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_durable_append(
+        &mut self,
+        update: SessionUpdate,
+    ) -> Result<(), crate::session::storage::AppendUpdateError> {
+        self.drain_pending().await?;
+        let result = self
+            .storage
+            .append_update_durable_commit_aware(&self.info, &update)
+            .await;
+        match (&update, &result) {
+            (SessionUpdate::Acp(notification), Ok(()))
+            | (
+                SessionUpdate::Acp(notification),
+                Err(crate::session::storage::AppendUpdateError::Committed(_)),
+            ) => self.queue_acp_sync((**notification).clone()),
+            _ => {}
+        }
+        result
     }
 
     /// Flush any pending merged ACP notification to disk and remote sync.
     async fn flush_pending(&mut self) {
-        // Write any pending merged ACP notification
-        if let Some(notification) = self.pending_notification.take() {
-            self.write_update(&SessionUpdate::Acp(Box::new(notification.clone())))
-                .await;
-            // HTTP-based remote sync (Writeback mode)
-            if let Some(sync) = &self.remote_sync {
-                sync.queue(notification.clone());
-            }
-            // WebSocket-based relay sync (real-time sharing)
-            if let Some(relay) = &self.relay_sync {
-                relay.queue(notification);
-            }
+        if let Err(error) = self.drain_pending().await {
+            tracing::warn!(%error, "failed to write pending update");
         }
-        // Flush HTTP sync
         if let Some(sync) = &self.remote_sync {
             sync.flush();
         }
-        // Flush WebSocket relay
         if let Some(relay) = &self.relay_sync {
             relay.flush();
         }
@@ -1560,23 +1663,31 @@ impl SessionPersistence {
                         SessionUpdate::Acp(notification) => {
                             // ACP notifications use merging to coalesce consecutive text chunks
                             if let Some(to_write) = self.maybe_merge_notification(&notification) {
-                                self.write_update(&SessionUpdate::Acp(Box::new(to_write.clone())))
-                                    .await;
-                                // HTTP-based remote sync (Writeback mode)
-                                if let Some(sync) = &self.remote_sync {
-                                    sync.queue(to_write.clone());
-                                }
-                                // WebSocket-based relay sync (real-time sharing)
-                                if let Some(relay) = &self.relay_sync {
-                                    relay.queue(to_write);
+                                match self
+                                    .write_update(&SessionUpdate::Acp(Box::new(to_write.clone())))
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(crate::session::storage::AppendUpdateError::Committed(
+                                        _,
+                                    )) => {
+                                        self.queue_acp_sync(to_write);
+                                    }
+                                    Err(error) => tracing::warn!(%error, "failed to write update"),
                                 }
                             }
                         }
                         SessionUpdate::Xai(_) => {
                             // xAI notifications are written directly without merging
-                            self.write_update(&update).await;
+                            if let Err(error) = self.write_update(&update).await {
+                                tracing::warn!(%error, "failed to write update");
+                            }
                         }
                     }
+                }
+                PersistenceMsg::AppendUpdateDurablyAndAck { update, respond_to } => {
+                    let result = self.handle_durable_append(update).await;
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::Chat(chat_msg) => {
                     if let Err(e) = self
@@ -2525,6 +2636,10 @@ fn classify_remote_delete(
         Err(e) => Err(DeleteSessionError::Remote(e)),
     }
 }
+
+#[cfg(test)]
+#[path = "persistence_tests.rs"]
+mod durable_update_tests;
 
 #[cfg(test)]
 mod delete_session_history_tests {

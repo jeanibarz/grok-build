@@ -295,7 +295,8 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
         effects[0],
     );
     assert!(
-        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. } if mid == &
+        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. }
+if mid == &
         model_id),
         "second effect must be SwitchModel(<resolved id>), got {:?}",
         effects[1],
@@ -548,6 +549,79 @@ fn set_timestamps_emits_persist_setting_with_correct_payload() {
     assert_eq!(app.current_ui.show_timestamps, Some(false));
 }
 #[test]
+fn set_timeline_emits_persist_setting_with_correct_payload() {
+    use crate::settings::SettingValue;
+    let mut app = test_app_with_agent();
+    let default_on = app.current_ui.show_timeline_enabled();
+    let effects = dispatch(Action::SetTimeline(!default_on), &mut app);
+    assert_eq!(effects.len(), 1);
+    match &effects[0] {
+        Effect::PersistSetting {
+            key,
+            value,
+            rollback_value,
+        } => {
+            assert_eq!(*key, "show_timeline");
+            assert_eq!(value, &SettingValue::Bool(!default_on));
+            assert_eq!(rollback_value, &SettingValue::Bool(default_on));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+    assert_eq!(app.current_ui.show_timeline, Some(!default_on));
+    assert_eq!(
+        crate::appearance::cache::load_show_timeline(),
+        !default_on,
+        "set_timeline must update the appearance cache"
+    );
+    assert_eq!(
+        app.appearance.show_timeline, !default_on,
+        "set_timeline must update the live appearance config"
+    );
+}
+#[test]
+fn set_timeline_toggles_displayed_state_when_current_ui_diverges() {
+    let mut app = test_app_with_agent();
+    app.appearance.show_timeline = true;
+    crate::appearance::cache::set_show_timeline(true);
+    app.current_ui.show_timeline = None;
+    assert!(
+        !app.current_ui.show_timeline_enabled(),
+        "current_ui resolves to the OFF default (the divergence)"
+    );
+    let new = !crate::appearance::cache::load_show_timeline();
+    assert!(!new, "toggle target is OFF");
+    let effects = dispatch(Action::SetTimeline(new), &mut app);
+    assert_eq!(effects.len(), 1, "toggle must persist, not silently no-op");
+    assert!(!app.appearance.show_timeline, "the rail is now hidden");
+    assert_eq!(app.current_ui.show_timeline, Some(false));
+}
+#[test]
+fn set_page_flip_on_send_emits_persist_setting_with_correct_payload() {
+    use crate::settings::SettingValue;
+    let mut app = test_app_with_agent();
+    let default_on = app.current_ui.page_flip_on_send_enabled();
+    crate::appearance::cache::set_page_flip_on_send(default_on);
+    let effects = dispatch(Action::SetPageFlipOnSend(!default_on), &mut app);
+    assert_eq!(effects.len(), 1);
+    match &effects[0] {
+        Effect::PersistSetting {
+            key,
+            value,
+            rollback_value,
+        } => {
+            assert_eq!(*key, "page_flip_on_send");
+            assert_eq!(value, &SettingValue::Bool(!default_on));
+            assert_eq!(rollback_value, &SettingValue::Bool(default_on));
+        }
+        other => panic!("expected PersistSetting, got {other:?}"),
+    }
+    assert_eq!(app.current_ui.page_flip_on_send, Some(!default_on));
+    assert_eq!(
+        crate::appearance::cache::load_page_flip_on_send(),
+        !default_on
+    );
+}
+#[test]
 fn set_simple_mode_emits_persist_setting_with_correct_payload() {
     use crate::settings::SettingValue;
     let mut app = test_app_with_agent();
@@ -633,10 +707,10 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     {
         let agent = app.agents.get_mut(&AgentId(0)).expect("agent must exist");
         if let Some(ActiveModal::Settings { state }) = &mut agent.active_modal {
-            state.query.push_str("stamp");
+            state.set_query("stamp");
             state.selected = 3;
             state.scroll_offset = 1;
-            state.mode = SettingsModalMode::FilterFocused;
+            state.focus_filter();
         } else {
             panic!("expected Settings modal");
         }
@@ -665,11 +739,11 @@ fn dispatch_confirm_reset_setting_cancel_preserves_modal_state() {
     match &agent.active_modal {
         Some(ActiveModal::Settings { state }) => {
             assert!(state.ui_snapshot.compact_mode, "ui_snapshot.compact_mode");
-            assert_eq!(state.query, "stamp", "query preserved");
+            assert_eq!(state.query(), "stamp", "query preserved");
             assert_eq!(state.selected, 3, "selected preserved");
             assert_eq!(state.scroll_offset, 1, "scroll_offset preserved");
             assert!(
-                matches!(state.mode, SettingsModalMode::FilterFocused),
+                matches!(state.mode(), SettingsModalMode::FilterFocused),
                 "mode preserved (FilterFocused)"
             );
         }
@@ -920,7 +994,8 @@ fn clear_default_model_persists_but_keeps_live_current() {
     );
     assert!(
         matches!(& effects[0], Effect::PersistSetting { key : "default_model", value :
-        crate ::settings::SettingValue::String(s), .. } if s.is_empty()),
+        crate ::settings::SettingValue::String(s), .. }
+if s.is_empty()),
         "expected PersistSetting(default_model, ''), got {:?}",
         effects[0],
     );
@@ -955,9 +1030,13 @@ fn set_default_model_resolves_known_name() {
     assert_eq!(effects.len(), 2);
     assert!(
         matches!(& effects[0], Effect::PersistSetting { key : "default_model", value :
-        crate ::settings::SettingValue::String(s), .. } if s == "grok-4.5")
+        crate ::settings::SettingValue::String(s), .. }
+if s == "grok-4.5")
     );
-    assert!(matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. } if mid == & id));
+    assert!(
+        matches!(& effects[1], Effect::SwitchModel { model_id : mid, .. }
+if mid == & id)
+    );
     assert_eq!(app.agents[&agent_id].session.models.current, Some(id));
 }
 /// Re-dispatching the same model
@@ -1140,6 +1219,14 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "show_timestamps" => {
             let _ = dispatch(Action::SetTimestamps(false), app);
         }
+        "show_timeline" => {
+            let away = !app.current_ui.show_timeline_enabled();
+            let _ = dispatch(Action::SetTimeline(away), app);
+        }
+        "page_flip_on_send" => {
+            let away = !crate::appearance::cache::load_page_flip_on_send();
+            let _ = dispatch(Action::SetPageFlipOnSend(away), app);
+        }
         "simple_mode" => {
             let _ = dispatch(Action::SetSimpleMode(false), app);
         }
@@ -1160,6 +1247,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "contextual_hints.word_select" => {
             let _ = dispatch(Action::SetContextualHintWordSelect(false), app);
+        }
+        "contextual_hints.ssh_wrap" => {
+            let _ = dispatch(Action::SetContextualHintSshWrap(false), app);
         }
         "multiline_mode" => {
             let _ = dispatch(Action::SetMultilineMode(true), app);
@@ -1198,7 +1288,7 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(Action::SetMaxThoughtsWidth(200), app);
         }
         "coding_data_sharing" => {
-            let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, app);
+            let _ = dispatch(Action::SetCodingDataSharing { opted_in: true }, app);
         }
         "plan_mode" => {
             let _ = dispatch(
@@ -1267,6 +1357,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "hunk_tracker_mode" => {
             let _ = dispatch(Action::SetHunkTrackerMode("all_dirty".to_string()), app);
+        }
+        "screen_mode" => {
+            let _ = dispatch(Action::SetScreenMode("minimal".to_string()), app);
         }
         "voice_capture_mode" => {
             let _ = dispatch(Action::SetVoiceCaptureMode("toggle".to_string()), app);

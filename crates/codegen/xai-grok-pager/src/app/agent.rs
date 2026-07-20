@@ -285,6 +285,7 @@ pub struct ScheduledTaskInfo {
     pub next_fire_at: Option<String>,
     /// Tag shown in the tasks pane (e.g. "loop", "check").
     pub tag: String,
+    pub last_subagent_id: Option<String>,
 }
 /// Parsed goal status from `GoalUpdated` session notifications.
 ///
@@ -759,12 +760,12 @@ impl AgentSession {
     /// Test-only setter for `yolo_mode` (the field is private; production toggles
     /// it via the permission-mode facade). Available to sibling crates' test
     /// builds through the test-only helpers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_yolo_mode_for_test(&mut self, on: bool) {
         self.yolo_mode = on;
     }
     /// Test-only setter for `auto_mode`. See [`Self::set_yolo_mode_for_test`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_auto_mode_for_test(&mut self, on: bool) {
         self.auto_mode = on;
     }
