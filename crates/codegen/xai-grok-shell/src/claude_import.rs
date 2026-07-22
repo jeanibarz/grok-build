@@ -2183,6 +2183,7 @@ extra_rule_dirs = ["/c/rules"]
         let resolved =
             xai_grok_workspace::permission::resolution::resolve_permissions_with_provenance(
                 dir.path(),
+                true,
             )
             .await;
         if let Some(r) = resolved {
@@ -2191,10 +2192,7 @@ extra_rule_dirs = ["/c/rules"]
             let leaked: Vec<&RequirementSource> = r
                 .sources
                 .iter()
-                .filter(|s| {
-                    matches!(s, RequirementSource::Settings { path }
-if path == &tempdir_claude)
-                })
+                .filter(|s| matches!(s, RequirementSource::Settings { path } if path == &tempdir_claude))
                 .collect();
             assert!(
                 leaked.is_empty(),
