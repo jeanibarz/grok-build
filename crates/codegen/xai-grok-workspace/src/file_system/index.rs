@@ -620,6 +620,11 @@ impl FileIndex {
             builder.overrides(overrides);
         }
 
+        // Hard-prune Claude Code / agent worktree dumps. These can be huge
+        // (full monorepo checkouts + node_modules) and gitignore often fails
+        // to skip them when nested under a recursive walk of `.claude`.
+        builder.filter_entry(|entry| !super::path_under_claude_worktrees(entry.path()));
+
         // Use parallel walking for better performance
         if options.parallel {
             builder.threads(num_cpus());
@@ -1375,6 +1380,39 @@ mod tests {
         assert_eq!(opts.max_depth, Some(3));
         assert!(!opts.respect_gitignore);
         assert!(!opts.skip_hidden);
+    }
+
+    #[test]
+    fn test_from_walk_hard_prunes_claude_worktrees() {
+        use std::fs;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(root.join(".claude/skills/foo")).unwrap();
+        fs::write(root.join(".claude/skills/foo/SKILL.md"), "x").unwrap();
+        fs::create_dir_all(root.join(".claude/worktrees/huge/node_modules/pkg")).unwrap();
+        fs::write(
+            root.join(".claude/worktrees/huge/node_modules/pkg/index.js"),
+            "x",
+        )
+        .unwrap();
+
+        // Even with gitignore disabled + hidden visible, worktrees dump is gone.
+        let options = WalkOptions::include_all();
+        let index = FileIndex::from_walk_with_options(root, options).unwrap();
+
+        assert!(index.contains("src/main.rs") || index.contains("src") || index.contains("main.rs"));
+        let paths: Vec<String> = index.iter().map(|(p, _)| p.to_string()).collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("worktrees") || p.contains("node_modules")),
+            "claude worktrees dump must not be indexed: {paths:?}"
+        );
+        // Real .claude config may still appear when hidden is not skipped.
+        assert!(
+            paths.iter().any(|p| p.contains("skills") || p.contains("SKILL")),
+            "real .claude skills still indexed: {paths:?}"
+        );
     }
 
     #[test]

@@ -119,6 +119,8 @@ fn collect_all_contents(
         },
     );
 
+    // Hard-prune `.claude/worktrees` (Claude Code / agent worktree dumps) so
+    // project-layout walks never descend into full nested monorepos.
     let walker = WalkBuilder::new(root)
         .max_depth(Some(max_depth + 1)) // +1 because depth 0 is root itself
         .follow_links(false)
@@ -128,6 +130,7 @@ fn collect_all_contents(
         .git_global(true)
         .git_exclude(true)
         .hidden(true)
+        .filter_entry(|entry| !super::path_under_claude_worktrees(entry.path()))
         .threads(NUM_WALK_THREADS)
         .build_parallel();
 

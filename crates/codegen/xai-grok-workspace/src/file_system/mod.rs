@@ -58,6 +58,26 @@ pub use fuzzy::{
 mod index;
 pub use index::{FileEntry, FileIndex, FileIndexDelta, SegmentId, StringInterner, WalkOptions};
 
+/// True when `path` is `.claude/worktrees` or anything nested under it.
+///
+/// Claude Code / agent runtimes dump linked checkouts there (often full
+/// monorepos + `node_modules`). Workspace walks and indexes must hard-prune
+/// that tree so startup stays fast even when gitignore fails to skip it.
+pub(crate) fn path_under_claude_worktrees(path: &Path) -> bool {
+    let mut saw_claude = false;
+    for comp in path.components() {
+        let std::path::Component::Normal(name) = comp else {
+            saw_claude = false;
+            continue;
+        };
+        if saw_claude && name == "worktrees" {
+            return true;
+        }
+        saw_claude = name == ".claude";
+    }
+    false
+}
+
 mod content;
 pub use content::{
     ContentMatch, ContentMatchFile, ContentSearchBatch, ContentSearchData, ContentSearchParams,

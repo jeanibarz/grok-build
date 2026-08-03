@@ -116,6 +116,54 @@ fn dir_named(p: &Path, name: &str) -> bool {
     p.file_name().is_some_and(|n| n == name)
 }
 
+/// Claude Code (and some agents) dump linked checkouts under `.claude/worktrees/`.
+/// Those trees often contain full copies of monorepos with nested `node_modules`
+/// and must never be watched or walked at startup — gitignore can fail to prune
+/// them when a recursive watch is rooted at `.claude` (ignore re-rooting), and
+/// the walk alone has been measured at ~60s on a kookr checkout with hundreds
+/// of worktrees.
+fn path_under_claude_worktrees(path: &Path) -> bool {
+    let mut saw_claude = false;
+    for comp in path.components() {
+        let std::path::Component::Normal(name) = comp else {
+            saw_claude = false;
+            continue;
+        };
+        if saw_claude && name == "worktrees" {
+            return true;
+        }
+        saw_claude = name == ".claude";
+    }
+    false
+}
+
+/// If `dir` is a `.claude` config root, expand it to its immediate children
+/// except `worktrees` so fan-out never installs a kernel-recursive watch on the
+/// entire worktree dump. Non-`.claude` dirs pass through unchanged.
+fn expand_claude_watch_roots(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !dir_named(&dir, ".claude") {
+            out.push(dir);
+            continue;
+        }
+        // Root already has a non-recursive watch covering files and new
+        // top-level entries under `.claude` itself; only fan into real
+        // config children (skills, agents, hooks, …).
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && !dir_named(p, "worktrees"))
+            .collect();
+        children.sort();
+        out.extend(children);
+    }
+    out
+}
+
 /// Whether Sapling (`.sl`) support is enabled (default on; `GROK_FSNOTIFY_SAPLING=0`
 /// or `false` disables it). Resolved once per watcher in `FsEventSource::start_on`
 /// and threaded down, so discovery, watching, and filtering can't disagree.
@@ -605,6 +653,9 @@ fn select_top_level_watch_dirs_capped(
         if dir_named(path, ".git") || dir_named(path, ".sl") {
             continue;
         }
+        if path_under_claude_worktrees(path) {
+            continue;
+        }
         if passes_custom_globs(path, custom_ignore, custom_include) {
             if dirs.len() == max {
                 return None; // one past the cap
@@ -612,7 +663,10 @@ fn select_top_level_watch_dirs_capped(
             dirs.push(path.to_path_buf());
         }
     }
-    Some(dirs)
+    // Expand `.claude` so fan-out never recursive-watches `.claude/worktrees`.
+    // Cap check above is on pre-expand count (top-level width), which is the
+    // fan-out decision input; expansion only rewrites a single child.
+    Some(expand_claude_watch_roots(dirs))
 }
 
 /// Ignore-aware walker that also **prunes descent** into `.git`/`.sl` named
@@ -641,6 +695,10 @@ fn pruning_walker(
         let path = entry.path();
         if dir_named(path, ".git") || dir_named(path, ".sl") {
             return false; // VCS metadata is watched separately (or not at all).
+        }
+        // Hard prune Claude/agent worktree dumps (see path_under_claude_worktrees).
+        if path_under_claude_worktrees(path) {
+            return false;
         }
         passes_custom_globs(path, &custom_ignore, &custom_include)
     });
@@ -3044,6 +3102,69 @@ mod tests {
             assert!(!dirs.iter().any(|d| d == root), "root must not be returned");
             // Files are covered by the root watch, not watched directly.
             assert!(!contains_name(&dirs, "README.md"));
+        }
+
+        #[test]
+        fn expands_claude_and_skips_worktrees() {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path();
+            fs::create_dir_all(root.join(".claude/skills/foo")).unwrap();
+            fs::create_dir_all(root.join(".claude/worktrees/huge/node_modules/pkg")).unwrap();
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join(".claude/skills/foo/SKILL.md"), "x").unwrap();
+            fs::write(
+                root.join(".claude/worktrees/huge/node_modules/pkg/index.js"),
+                "x",
+            )
+            .unwrap();
+
+            let dirs = select_top_level_watch_dirs(root, &None, &None);
+
+            assert!(
+                contains_name(&dirs, "src"),
+                "src must still be watched: {dirs:?}"
+            );
+            // Fan-out must NOT recursive-watch the whole `.claude` (would enter
+            // worktrees); it expands to real config children instead.
+            assert!(
+                !contains_name(&dirs, ".claude"),
+                ".claude itself must not be a recursive watch root: {dirs:?}"
+            );
+            assert!(
+                dirs.iter().any(|d| d.ends_with(".claude/skills")),
+                "skills child of .claude must be watched: {dirs:?}"
+            );
+            assert!(
+                !dirs.iter().any(|d| d.ends_with(".claude/worktrees")
+                    || path_under_claude_worktrees(d)),
+                "worktrees must never be a watch root: {dirs:?}"
+            );
+
+            // Per-dir selection must also prune the dump.
+            let per_dir = select_per_dir_watch_dirs(root, &None, &None);
+            assert!(
+                !per_dir.iter().any(|d| path_under_claude_worktrees(d)),
+                "per-dir must not arm under .claude/worktrees: {per_dir:?}"
+            );
+            assert!(
+                per_dir.iter().any(|d| d.ends_with(".claude/skills")
+                    || d.ends_with(".claude/skills/foo")),
+                "real .claude config dirs still selected: {per_dir:?}"
+            );
+        }
+
+        #[test]
+        fn path_under_claude_worktrees_detects_nested() {
+            assert!(path_under_claude_worktrees(Path::new(
+                "/repo/.claude/worktrees"
+            )));
+            assert!(path_under_claude_worktrees(Path::new(
+                "/repo/.claude/worktrees/wt/node_modules"
+            )));
+            assert!(!path_under_claude_worktrees(Path::new("/repo/.claude/skills")));
+            assert!(!path_under_claude_worktrees(Path::new(
+                "/repo/worktrees/other"
+            )));
         }
 
         #[test]
