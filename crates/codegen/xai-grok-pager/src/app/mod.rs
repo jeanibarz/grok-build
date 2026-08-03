@@ -1131,33 +1131,18 @@ fn init_terminal(
         if want_minimal {
             win_native_selection::enable_native_selection();
         }
+        // Mouse only — do NOT enable bracketed paste yet. Hosts such as Kookr
+        // treat `ESC[?2004h` as "TUI accepts paste", then inject the initial
+        // prompt. Any subsequent init step that *reads stdin* (CSI 6n preflight,
+        // crossterm cursor::position, drain_pending_events) will consume that
+        // paste as probe noise and the prompt is lost. Contract: all stdin
+        // probes finish, then we emit EnableBracketedPaste last.
         xai_grok_shell::util::with_locked_stderr(|stderr| {
             if !want_minimal {
                 execute!(stderr, event::EnableMouseCapture)?;
             } else if crate::terminal::terminal_context().mouse_reporting_leaks_as_raw_text() {
                 let _ = stderr.write_all(xai_crash_handler::terminal::MOUSE_TRACKING_RESET);
             }
-            execute!(
-                stderr,
-                event::EnableFocusChange,
-                event::EnableBracketedPaste,
-                cursor::Hide,
-            )?;
-            let policy = cursor_style_policy(cursor_blink);
-            match policy {
-                CursorStylePolicy::Inherit => {}
-                CursorStylePolicy::ForceBlinking => {
-                    execute!(
-                        stderr,
-                        cursor::EnableBlinking,
-                        SetCursorStyle::BlinkingBlock
-                    )?;
-                }
-                CursorStylePolicy::ForceSteady => {
-                    execute!(stderr, cursor::DisableBlinking, SetCursorStyle::SteadyBlock)?;
-                }
-            }
-            CURSOR_STYLE_FORCED.store(policy != CursorStylePolicy::Inherit, Ordering::Release);
             io::Result::Ok(())
         })?;
         MOUSE_CAPTURE_ENABLED.store(!want_minimal, Ordering::Release);
@@ -1199,15 +1184,20 @@ fn init_terminal(
             );
         }
         crate::terminal::set_kitty_flags_pushed(use_keyboard_enhancement);
-        if mode.is_fullscreen() {
+
+        // Build the terminal *before* advertising paste-ready. Inline viewport
+        // construction calls crossterm `cursor::position()` (CSI 6n, hard 2s
+        // timeout on silent hosts). Preflight with a short budget under silent
+        // hosts (dtach/Kookr) so we fall back to Fixed without blocking.
+        let built = if mode.is_fullscreen() {
             let backend = CrosstermBackend::new(
                 crate::render::draw::TermWriter::new(frame_tx, writer_sync)
                     .map_err(io::Error::other)?,
             );
-            Ok((
+            (
                 xai_ratatui_inline::Terminal::new(backend)?,
                 ScreenMode::Fullscreen,
-            ))
+            )
         } else {
             let (cols, rows) = crossterm::terminal::size()?;
             let viewport_rows = if want_minimal {
@@ -1215,17 +1205,10 @@ fn init_terminal(
             } else {
                 rows
             };
-            // Inline viewport construction calls crossterm `cursor::position()`,
-            // which blocks up to 2s on CSI 6n when the host never replies
-            // (dtach without an attached client — Kookr's launch path uses
-            // `--no-alt-screen` and hits this every spawn). Preflight with a
-            // short budget; if silent, skip straight to Fixed (same geometry
-            // as the previous timeout-fallback path) so first paint stays
-            // under ~1s.
             let cursor_answers = crate::terminal::cursor_position_responsive(
                 crate::terminal::CURSOR_POSITION_PREFLIGHT_TIMEOUT,
             );
-            if cursor_answers {
+            let term_mode = if cursor_answers {
                 let probe_backend = CrosstermBackend::new(
                     crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
                         .map_err(io::Error::other)?,
@@ -1236,16 +1219,15 @@ fn init_terminal(
                         viewport: ratatui::Viewport::Inline(viewport_rows),
                     },
                 ) {
-                    return Ok((
+                    Some((
                         term,
                         if want_minimal {
                             ScreenMode::Minimal
                         } else {
                             ScreenMode::Inline
                         },
-                    ));
-                }
-                if want_minimal {
+                    ))
+                } else if want_minimal {
                     tracing::warn!(
                         "minimal: inline viewport probe failed; downgrading to full-height inline"
                     );
@@ -1257,16 +1239,17 @@ fn init_terminal(
                         crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
                             .map_err(io::Error::other)?,
                     );
-                    if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
+                    xai_ratatui_inline::Terminal::with_options(
                         retry_backend,
                         ratatui::TerminalOptions {
                             viewport: ratatui::Viewport::Inline(rows),
                         },
-                    ) {
-                        return Ok((term, ScreenMode::Inline));
-                    }
+                    )
+                    .ok()
+                    .map(|term| (term, ScreenMode::Inline))
                 } else {
                     tracing::error!("inline viewport probe failed, using Viewport::Fixed");
+                    None
                 }
             } else {
                 tracing::info!(
@@ -1274,28 +1257,67 @@ fn init_terminal(
                         as u64,
                     "inline cursor preflight timed out; using Viewport::Fixed (snappy headless path)"
                 );
+                None
+            };
+            if let Some(built) = term_mode {
+                built
+            } else {
+                xai_grok_shell::util::with_locked_stderr(|stderr| {
+                    execute!(
+                        stderr,
+                        crossterm::terminal::ScrollUp(rows),
+                        cursor::MoveTo(0, 0),
+                    )
+                })?;
+                let backend = CrosstermBackend::new(
+                    crate::render::draw::TermWriter::new(frame_tx, writer_sync)
+                        .map_err(io::Error::other)?,
+                );
+                let term = xai_ratatui_inline::Terminal::with_options(
+                    backend,
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(
+                            0, 0, cols, rows,
+                        )),
+                    },
+                )?;
+                (term, ScreenMode::Inline)
             }
-            xai_grok_shell::util::with_locked_stderr(|stderr| {
-                execute!(
-                    stderr,
-                    crossterm::terminal::ScrollUp(rows),
-                    cursor::MoveTo(0, 0),
-                )
-            })?;
-            let backend = CrosstermBackend::new(
-                crate::render::draw::TermWriter::new(frame_tx, writer_sync)
-                    .map_err(io::Error::other)?,
-            );
-            let term = xai_ratatui_inline::Terminal::with_options(
-                backend,
-                ratatui::TerminalOptions {
-                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(
-                        0, 0, cols, rows,
-                    )),
-                },
+        };
+
+        // Discard any residual probe bytes (CSI replies, etc.) so they never
+        // sit ahead of real input once the event loop starts.
+        drain_pending_events();
+
+        // LAST: advertise paste-ready. After this write, init must not read
+        // stdin — Kookr (and similar hosts) may inject the initial prompt
+        // immediately on seeing ESC[?2004h.
+        xai_grok_shell::util::with_locked_stderr(|stderr| {
+            execute!(
+                stderr,
+                event::EnableFocusChange,
+                event::EnableBracketedPaste,
+                cursor::Hide,
             )?;
-            Ok((term, ScreenMode::Inline))
-        }
+            let policy = cursor_style_policy(cursor_blink);
+            match policy {
+                CursorStylePolicy::Inherit => {}
+                CursorStylePolicy::ForceBlinking => {
+                    execute!(
+                        stderr,
+                        cursor::EnableBlinking,
+                        SetCursorStyle::BlinkingBlock
+                    )?;
+                }
+                CursorStylePolicy::ForceSteady => {
+                    execute!(stderr, cursor::DisableBlinking, SetCursorStyle::SteadyBlock)?;
+                }
+            }
+            CURSOR_STYLE_FORCED.store(policy != CursorStylePolicy::Inherit, Ordering::Release);
+            io::Result::Ok(())
+        })?;
+
+        Ok(built)
     })()
     .inspect_err(|_| {
         emit_terminal_teardown_sequences(mode, None);
