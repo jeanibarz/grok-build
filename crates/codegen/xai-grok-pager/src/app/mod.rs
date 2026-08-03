@@ -1215,47 +1215,65 @@ fn init_terminal(
             } else {
                 rows
             };
-            let probe_backend = CrosstermBackend::new(
-                crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
-                    .map_err(io::Error::other)?,
+            // Inline viewport construction calls crossterm `cursor::position()`,
+            // which blocks up to 2s on CSI 6n when the host never replies
+            // (dtach without an attached client — Kookr's launch path uses
+            // `--no-alt-screen` and hits this every spawn). Preflight with a
+            // short budget; if silent, skip straight to Fixed (same geometry
+            // as the previous timeout-fallback path) so first paint stays
+            // under ~1s.
+            let cursor_answers = crate::terminal::cursor_position_responsive(
+                crate::terminal::CURSOR_POSITION_PREFLIGHT_TIMEOUT,
             );
-            if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
-                probe_backend,
-                ratatui::TerminalOptions {
-                    viewport: ratatui::Viewport::Inline(viewport_rows),
-                },
-            ) {
-                return Ok((
-                    term,
-                    if want_minimal {
-                        ScreenMode::Minimal
-                    } else {
-                        ScreenMode::Inline
-                    },
-                ));
-            }
-            if want_minimal {
-                tracing::warn!(
-                    "minimal: inline viewport probe failed; downgrading to full-height inline"
-                );
-                xai_grok_shell::util::with_locked_stderr(|stderr| {
-                    execute!(stderr, event::EnableMouseCapture)
-                })?;
-                MOUSE_CAPTURE_ENABLED.store(true, Ordering::Release);
-                let retry_backend = CrosstermBackend::new(
+            if cursor_answers {
+                let probe_backend = CrosstermBackend::new(
                     crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
                         .map_err(io::Error::other)?,
                 );
                 if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
-                    retry_backend,
+                    probe_backend,
                     ratatui::TerminalOptions {
-                        viewport: ratatui::Viewport::Inline(rows),
+                        viewport: ratatui::Viewport::Inline(viewport_rows),
                     },
                 ) {
-                    return Ok((term, ScreenMode::Inline));
+                    return Ok((
+                        term,
+                        if want_minimal {
+                            ScreenMode::Minimal
+                        } else {
+                            ScreenMode::Inline
+                        },
+                    ));
+                }
+                if want_minimal {
+                    tracing::warn!(
+                        "minimal: inline viewport probe failed; downgrading to full-height inline"
+                    );
+                    xai_grok_shell::util::with_locked_stderr(|stderr| {
+                        execute!(stderr, event::EnableMouseCapture)
+                    })?;
+                    MOUSE_CAPTURE_ENABLED.store(true, Ordering::Release);
+                    let retry_backend = CrosstermBackend::new(
+                        crate::render::draw::TermWriter::new(frame_tx.clone(), writer_sync.clone())
+                            .map_err(io::Error::other)?,
+                    );
+                    if let Ok(term) = xai_ratatui_inline::Terminal::with_options(
+                        retry_backend,
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Inline(rows),
+                        },
+                    ) {
+                        return Ok((term, ScreenMode::Inline));
+                    }
+                } else {
+                    tracing::error!("inline viewport probe failed, using Viewport::Fixed");
                 }
             } else {
-                tracing::error!("inline viewport probe failed, using Viewport::Fixed");
+                tracing::info!(
+                    timeout_ms = crate::terminal::CURSOR_POSITION_PREFLIGHT_TIMEOUT.as_millis()
+                        as u64,
+                    "inline cursor preflight timed out; using Viewport::Fixed (snappy headless path)"
+                );
             }
             xai_grok_shell::util::with_locked_stderr(|stderr| {
                 execute!(

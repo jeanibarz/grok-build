@@ -14,11 +14,12 @@ pub mod hyperlinks;
 pub mod image;
 pub mod keyboard;
 pub mod overlay;
-pub(crate) mod probe;
+pub mod probe;
 pub mod tmux_probe;
 pub mod xtversion;
 
 pub use embedded_editor::{EmbeddedEditor, embedded_editor_from_env};
+pub use probe::{CURSOR_POSITION_PREFLIGHT_TIMEOUT, cursor_position_responsive};
 pub use hyperlinks::{
     HyperlinkCapabilities, Osc8Support, SchemeFilter, SetDefaultCursor, SetPointerCursor,
     hyperlink_capabilities,
