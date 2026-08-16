@@ -437,7 +437,9 @@ impl MvpAgent {
     ///
     /// Must be called right after construction: entries registered on the
     /// constructor-created default instance are NOT migrated.
-    pub(crate) fn set_activity(
+    // `pub` (not `pub(crate)`): the fork installs activity from the pager's ACP
+    // spawn path (`xai-grok-pager::acp::spawn`), a cross-crate caller.
+    pub fn set_activity(
         &mut self,
         activity: crate::agent::activity::AgentActivity,
     ) {

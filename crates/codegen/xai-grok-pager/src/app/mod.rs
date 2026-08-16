@@ -1561,7 +1561,7 @@ fn init_terminal(
 
         // Discard any residual probe bytes (CSI replies, etc.) so they never
         // sit ahead of real input once the event loop starts.
-        drain_pending_events();
+        let _ = event_loop::drain_pending_events(std::time::Duration::from_millis(0), |_| false);
 
         // LAST: advertise paste-ready. After this write, init must not read
         // stdin — Kookr (and similar hosts) may inject the initial prompt
