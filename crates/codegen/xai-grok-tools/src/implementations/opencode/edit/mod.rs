@@ -48,9 +48,8 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 // to "" here (the kind-params map is keyed by schema property names).
 const DESCRIPTION: &str = r#"Performs exact string replacements in files.
 
-Usage:
-- You must use your `${{ tools.by_kind.read }}` tool at least once in the conversation before editing.
-- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + →. Everything after that → separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.
+Usage:${%- if tools.by_kind.read %}
+- When editing text from ${{ tools.by_kind.read }} tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + ": ". Everything after that ": " separator is the actual file content to match. Never include any part of the line number prefix in the ${{ params.edit.oldString }} or ${{ params.edit.newString }}.${%- endif %}
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - The edit will FAIL if `${{ params.edit.oldString }}` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `${{ params.edit.replaceAll }}` to change every instance of `${{ params.edit.oldString }}`.
 - Use `${{ params.edit.replaceAll }}` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
@@ -88,27 +87,34 @@ pub struct EditInput {
     pub replace_all: bool,
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// ToolInput conversions (via Dynamic variant)
-// ───────────────────────────────────────────────────────────────────────────
-
 impl TryFrom<crate::types::tool_io::ToolInput> for EditInput {
     type Error = String;
     fn try_from(value: crate::types::tool_io::ToolInput) -> Result<Self, Self::Error> {
         match value {
+            crate::types::tool_io::ToolInput::SearchReplace(sr) => Ok(Self {
+                file_path: sr.file_path,
+                old_string: sr.old_string,
+                new_string: sr.new_string,
+                replace_all: sr.replace_all,
+            }),
             crate::types::tool_io::ToolInput::Dynamic(v) => {
                 serde_json::from_value(v).map_err(|e| format!("EditInput: {e}"))
             }
-            _ => Err("expected Dynamic variant for EditInput".into()),
+            _ => Err("expected SearchReplace or Dynamic variant for EditInput".into()),
         }
     }
 }
 
+// Prefer SearchReplace over Dynamic so AccessKind maps to Edit(path).
 impl From<EditInput> for crate::types::tool_io::ToolInput {
     fn from(value: EditInput) -> Self {
-        crate::types::tool_io::ToolInput::Dynamic(
-            serde_json::to_value(value).expect("EditInput serializes to JSON"),
-        )
+        crate::implementations::grok_build::search_replace::SearchReplaceInput {
+            file_path: value.file_path,
+            old_string: value.old_string,
+            new_string: value.new_string,
+            replace_all: value.replace_all,
+        }
+        .into()
     }
 }
 
@@ -156,7 +162,7 @@ impl xai_tool_runtime::Tool for EditTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "edit",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -521,6 +527,21 @@ mod tests {
             new_string: new_string.to_string(),
             replace_all: false,
         }
+    }
+
+    #[test]
+    fn tool_input_roundtrip_is_search_replace() {
+        use crate::types::tool_io::ToolInput;
+        let input = make_input("/tmp/denied.txt", "old", "new");
+        let tool_input = ToolInput::from(input.clone());
+        assert!(matches!(
+            tool_input,
+            ToolInput::SearchReplace(ref sr) if sr.file_path == "/tmp/denied.txt"
+        ));
+        let back = EditInput::try_from(tool_input).expect("SearchReplace converts back");
+        assert_eq!(back.file_path, "/tmp/denied.txt");
+        assert_eq!(back.old_string, "old");
+        assert_eq!(back.new_string, "new");
     }
 
     #[test]

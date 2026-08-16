@@ -51,9 +51,8 @@ use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
 use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
 use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
-use xai_grok_tools::implementations::grok_build::task::types::{
-    MonitorEventBuffer, SubagentEvent, TaskModelValidator,
-};
+use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
+use xai_grok_tools::implementations::grok_build::task::types::{SubagentEvent, TaskModelValidator};
 use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
 use xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig;
 use xai_grok_tools::implementations::lsp::LspBackend;
@@ -93,11 +92,16 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
     pub web_search_config: WebSearchConfig,
+    /// `[toolset.web_search]` domain policy, resolved once at spawn and applied
+    /// to both search paths (the hosted `tool_overrides` merge and the
+    /// client-side `WebSearchConfig`) so they never diverge.
+    pub web_search_domains: Option<xai_grok_sampling_types::WebSearchOptions>,
     pub backend_search: bool,
     pub web_fetch_config: WebFetchConfig,
     pub image_gen_config: ImageGenConfig,
     pub video_gen_config: VideoGenConfig,
     pub app_builder_deployer_config: AppBuilderDeployerConfig,
+    pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
     pub write_file_enabled: bool,
     pub subagents_enabled: bool,
     pub subagent_toggle: HashMap<String, bool>,
@@ -122,10 +126,14 @@ pub(crate) struct AgentRebuildSpec {
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
     pub user_question_tx: UnboundedSender<UserQuestionRequest>,
     pub subagent_depth: u32,
+    pub subagents_max_depth: u32,
     pub session_id_str: String,
     pub blocking_wait_depth: Arc<crate::tools::tool_context::BlockingWaitState>,
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
+    /// Fire side of the scheduler mode. The spawn copies the same resolution
+    /// onto [`SessionHandle::scheduler_background_loops`](crate::session::SessionHandle),
+    /// which is what clients read — keep the two on one resolve.
     pub scheduler_background_loops: bool,
     pub mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
     pub managed_gateway_tool_client:
@@ -144,7 +152,7 @@ impl AgentRebuildSpec {
     /// `#[deny(unused_variables)]` ensures any newly added spec field is
     /// used here, otherwise compilation fails.
     #[deny(unused_variables)]
-    pub async fn build_agent(
+    pub(crate) async fn build_agent(
         self: &Arc<Self>,
         definition: AgentDefinition,
     ) -> Result<Agent, AgentBuildError> {
@@ -161,7 +169,7 @@ impl AgentRebuildSpec {
     ///
     /// Both are consumed once — the rebuild path (`build_agent`) passes
     /// `None` for both so zero-turn model switches get fresh discovery.
-    pub async fn build_agent_with_initial_overrides(
+    pub(crate) async fn build_agent_with_initial_overrides(
         self: &Arc<Self>,
         definition: AgentDefinition,
         persisted_skill_names: Option<std::collections::HashSet<String>>,
@@ -192,11 +200,13 @@ impl AgentRebuildSpec {
             memory_workspace_path,
             memory_backend,
             web_search_config,
+            web_search_domains,
             backend_search,
             web_fetch_config,
             image_gen_config,
             video_gen_config,
             app_builder_deployer_config,
+            media_gen_batch_limits: _,
             write_file_enabled,
             subagents_enabled,
             subagent_toggle,
@@ -219,6 +229,7 @@ impl AgentRebuildSpec {
             monitor_event_buffer,
             user_question_tx,
             subagent_depth,
+            subagents_max_depth,
             session_id_str,
             blocking_wait_depth,
             respect_gitignore,
@@ -235,6 +246,18 @@ impl AgentRebuildSpec {
         #[allow(unused_variables)]
         let is_cursor_template =
             crate::session::is_cursor_system_template(&definition.system_prompt);
+        let mut definition = definition;
+        if let Some(cfg_opts) = web_search_domains.clone() {
+            definition
+                .tool_overrides
+                .get_or_insert_with(Default::default)
+                .web_search = Some(cfg_opts);
+        }
+        let session_env = {
+            let mut env = session_env.as_ref().clone();
+            env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
+            Arc::new(env)
+        };
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
@@ -327,7 +350,7 @@ impl AgentRebuildSpec {
                 ChannelBackend, SubagentBackendResource,
             };
             use xai_grok_tools::implementations::grok_build::task::types::{
-                SessionIdResource, SubagentDepthCounter, SubagentEventSender,
+                MaxSubagentDepth, SessionIdResource, SubagentDepthCounter, SubagentEventSender,
             };
             let backend = SubagentBackendResource(Arc::new(ChannelBackend::for_session(
                 event_tx.clone(),
@@ -337,6 +360,10 @@ impl AgentRebuildSpec {
             agent
                 .tool_bridge()
                 .update_resource(SubagentDepthCounter(*subagent_depth))
+                .await;
+            agent
+                .tool_bridge()
+                .update_resource(MaxSubagentDepth(*subagents_max_depth))
                 .await;
             agent
                 .tool_bridge()
@@ -413,11 +440,13 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_workspace_path: None,
         memory_backend: None,
         web_search_config: WebSearchConfig::default(),
+        web_search_domains: None,
         backend_search: false,
         web_fetch_config: WebFetchConfig::Disabled,
         image_gen_config: ImageGenConfig::default(),
         video_gen_config: VideoGenConfig::default(),
         app_builder_deployer_config: AppBuilderDeployerConfig::default(),
+        media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits::default(),
         write_file_enabled: true,
         subagents_enabled: false,
         subagent_toggle: HashMap::new(),
@@ -440,6 +469,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         monitor_event_buffer: None,
         user_question_tx: uq_tx,
         subagent_depth: 0,
+        subagents_max_depth: xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH,
         session_id_str: "test-session".to_string(),
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         respect_gitignore: false,
@@ -473,6 +503,84 @@ mod tests {
             .find(|definition| definition.function.name == task_name)
             .and_then(|definition| definition.function.description)
             .expect("GrokBuild Task description should be present")
+    }
+    /// The `[toolset.web_search]` policy is authoritative on the backend-hosted
+    /// path: agent frontmatter is model-writable (`.grok/agents/*.md`), so a
+    /// configured blocklist must survive a frontmatter allowlist, matching the
+    /// client-side `resolve_filters`. With no configured policy, frontmatter
+    /// still applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_web_search_domains_beat_agent_frontmatter() {
+        use xai_grok_sampling_types::{HostedTool, ToolOverrides, WebSearchOptions};
+        let frontmatter = WebSearchOptions {
+            allowed_domains: Some(vec!["attacker.example".into()]),
+            excluded_domains: None,
+        };
+        let configured = WebSearchOptions {
+            allowed_domains: None,
+            excluded_domains: Some(vec!["reddit.com".into()]),
+        };
+        let definition = || {
+            let mut d = AgentDefinition::default_grok_build();
+            d.tool_overrides = Some(ToolOverrides {
+                x_search: None,
+                web_search: Some(frontmatter.clone()),
+            });
+            d
+        };
+        let spec_with = |domains: Option<WebSearchOptions>| {
+            let mut spec = test_rebuild_spec_default();
+            let spec_mut =
+                Arc::get_mut(&mut spec).expect("test rebuild spec should be uniquely owned");
+            spec_mut.web_search_domains = domains;
+            spec_mut.backend_search = true;
+            spec_mut.web_search_config = WebSearchConfig::Enabled {
+                api_key: "test-key".to_string(),
+                base_url: "https://api.x.ai/v1".to_string(),
+                model: "grok-4".to_string(),
+                extra_headers: Default::default(),
+                alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
+            };
+            spec
+        };
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let agent = spec_with(Some(configured.clone()))
+                    .build_agent(definition())
+                    .await
+                    .expect("agent build should succeed");
+                assert_eq!(
+                    agent
+                        .definition()
+                        .tool_overrides
+                        .as_ref()
+                        .and_then(|o| o.web_search.clone()),
+                    Some(configured.clone()),
+                    "config must replace the frontmatter allowlist"
+                );
+                assert!(
+                    agent.hosted_tools().contains(&HostedTool::WebSearch {
+                        options: Some(configured.clone()),
+                    }),
+                    "the hosted tool carries the configured policy: {:?}",
+                    agent.hosted_tools()
+                );
+                let agent = spec_with(None)
+                    .build_agent(definition())
+                    .await
+                    .expect("agent build should succeed");
+                assert_eq!(
+                    agent
+                        .definition()
+                        .tool_overrides
+                        .as_ref()
+                        .and_then(|o| o.web_search.clone()),
+                    Some(frontmatter.clone())
+                );
+            })
+            .await;
     }
     #[tokio::test(flavor = "current_thread")]
     async fn rebuild_projects_fresh_public_model_keys_into_task_description() {
