@@ -110,7 +110,7 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         prompt: None,
         child_cwd: None,
         worktree_path: None,
-        child_updates_replayed: false,
+        transcript: Default::default(),
     }
 }
 #[test]
@@ -180,6 +180,7 @@ pub(super) fn last_session_event(sb: &ScrollbackState) -> Option<SessionEvent> {
 pub(super) fn make_app_with_agent(session_id: &str) -> AppView {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = AppView::new(tx.clone(), ModelState::default(), Vec::new());
+    app.leader_mode = true;
     let id = AgentId(0);
     let agent = make_agent(Some(session_id));
     app.agents.insert(id, agent);
@@ -239,26 +240,7 @@ pub(super) fn insert_running_task(agent: &mut AgentView, task_id: &str, command:
             },
         );
 }
-/// Marker texts of all parked blocks in scrollback, in order — one per
-/// park episode (re-pushed only after new parent output, i.e. a re-park).
-pub(super) fn parked_marker_messages(agent: &AgentView) -> Vec<String> {
-    (0..agent.scrollback.len())
-        .filter_map(|i| match agent.scrollback.get(i).map(|e| &e.block) {
-            Some(RenderBlock::SessionEvent(b)) if b.parked => Some(b.event.message()),
-            _ => None,
-        })
-        .collect()
-}
-pub(super) fn parked_marker_ids(agent: &AgentView) -> Vec<EntryId> {
-    (0..agent.scrollback.len())
-        .filter_map(|i| {
-            let entry = agent.scrollback.get(i)?;
-            matches!(&entry.block, RenderBlock::SessionEvent(b) if b.parked)
-                .then_some(entry.id)
-        })
-        .collect()
-}
-pub(super) fn park_on_subagents(agent: &mut AgentView, child_ids: &[&str]) -> EntryId {
+pub(super) fn park_on_subagents(agent: &mut AgentView, child_ids: &[&str]) {
     use crate::app::agent_view::test_fixtures::simulate_wait_all;
     agent.session.state = AgentState::TurnRunning;
     agent.session.current_prompt_id = Some("p1".into());
@@ -266,9 +248,7 @@ pub(super) fn park_on_subagents(agent: &mut AgentView, child_ids: &[&str]) -> En
         agent.subagent_sessions.insert(child_id.into(), make_subagent_info(child_id));
     }
     simulate_wait_all(agent);
-    agent.maybe_push_parked_marker();
     assert!(agent.renders_parked());
-    parked_marker_ids(agent)[0]
 }
 pub(super) fn follow_ups_ext(
     response_id: &str,
@@ -693,12 +673,26 @@ pub(super) fn make_deleted_ext_notif(
     session_id: &str,
     task_id: &str,
 ) -> acp::ExtNotification {
+    make_deleted_ext_notif_with_reason(
+        session_id,
+        task_id,
+        xai_grok_tools::notification::ScheduledTaskRemovedReason::Unknown,
+        false,
+    )
+}
+pub(super) fn make_deleted_ext_notif_with_reason(
+    session_id: &str,
+    task_id: &str,
+    reason: xai_grok_tools::notification::ScheduledTaskRemovedReason,
+    is_replay: bool,
+) -> acp::ExtNotification {
     let notif = SessionNotification {
         session_id: acp::SessionId::new(session_id),
         update: XaiSessionUpdate::ScheduledTaskDeleted {
             task_id: task_id.into(),
+            reason,
         },
-        meta: None,
+        meta: is_replay.then(crate::acp::meta::ReplayMetaStamp::replayed),
     };
     let raw = serde_json::value::to_raw_value(&notif).unwrap();
     acp::ExtNotification::new("x.ai/scheduled_task_deleted", std::sync::Arc::from(raw))
@@ -947,6 +941,7 @@ pub(super) fn prompt_complete_ext_with_prompt_id(
                 prompt_id: Some(prompt_id.to_string()),
                 agent_result: None,
                 cancel_trigger: None,
+                cancellation_category: None,
                 meta: None,
             },
         )
@@ -1003,6 +998,33 @@ pub(super) fn xai_turn_completed_notif(
             usage: None,
         },
         meta: Some(serde_json::json!({ "isReplay": is_replay })),
+    };
+    acp::ExtNotification::new(
+        "x.ai/session/update",
+        std::sync::Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+    )
+}
+/// Live `TurnCompleted` stamped with `_meta.cancelTrigger` (send-now / ctrl_c).
+pub(super) fn xai_turn_completed_notif_with_cancel_trigger(
+    session_id: &str,
+    prompt_id: &str,
+    stop_reason: &str,
+    cancel_trigger: &str,
+) -> acp::ExtNotification {
+    let payload = SessionNotification {
+        session_id: acp::SessionId::new(session_id),
+        update: XaiSessionUpdate::TurnCompleted {
+            prompt_id: prompt_id.into(),
+            stop_reason: stop_reason.into(),
+            agent_result: None,
+            usage: None,
+        },
+        meta: Some(
+            serde_json::json!({
+                "isReplay": false,
+                "cancelTrigger": cancel_trigger,
+            }),
+        ),
     };
     acp::ExtNotification::new(
         "x.ai/session/update",
@@ -1292,6 +1314,13 @@ pub(super) fn test_subagent_spawned(
     parent_sid: &str,
     child_sid: &str,
 ) -> XaiSessionUpdate {
+    test_subagent_spawned_for_workflow(parent_sid, child_sid, None)
+}
+pub(super) fn test_subagent_spawned_for_workflow(
+    parent_sid: &str,
+    child_sid: &str,
+    workflow_run_id: Option<String>,
+) -> XaiSessionUpdate {
     XaiSessionUpdate::SubagentSpawned {
         subagent_id: child_sid.into(),
         parent_session_id: parent_sid.into(),
@@ -1302,7 +1331,7 @@ pub(super) fn test_subagent_spawned(
         effective_context_source: None,
         context_normalized: false,
         capability_mode: None,
-        workflow_run_id: None,
+        workflow_run_id,
         persona: None,
         role: None,
         model: None,
@@ -1455,9 +1484,17 @@ pub(super) fn write_child_updates_jsonl(
     child_sid: &str,
     content: &str,
 ) {
+    write_child_updates_jsonl_under_cwd(grok_home, "/tmp", child_sid, content);
+}
+pub(super) fn write_child_updates_jsonl_under_cwd(
+    grok_home: &std::path::Path,
+    cwd: &str,
+    child_sid: &str,
+    content: &str,
+) {
     let sessions_dir = grok_home
         .join("sessions")
-        .join(urlencoding::encode("/tmp").as_ref())
+        .join(xai_grok_config::encode_cwd_dirname(cwd))
         .join(child_sid);
     std::fs::create_dir_all(&sessions_dir).unwrap();
     std::fs::write(sessions_dir.join("summary.json"), "{}").unwrap();
@@ -1474,6 +1511,21 @@ pub(super) fn child_scrollback_tool_call_count(
                 .scrollback
                 .entry(*i)
                 .is_some_and(|e| matches!(e.block, RenderBlock::ToolCall(_)))
+        })
+        .count()
+}
+/// `SessionEvent` blocks (the `TurnCompleted` footer) in a child scrollback.
+pub(super) fn child_scrollback_session_event_count(
+    agent: &AgentView,
+    child_sid: &str,
+) -> usize {
+    let child = agent.subagent_views.get(child_sid).expect("child subagent view");
+    (0..child.scrollback.len())
+        .filter(|i| {
+            child
+                .scrollback
+                .entry(*i)
+                .is_some_and(|e| matches!(e.block, RenderBlock::SessionEvent(_)))
         })
         .count()
 }
@@ -1836,8 +1888,11 @@ pub(super) fn task_completed_notif(
                 kind: Default::default(),
                 block_waited: false,
                 explicitly_killed: false,
+                kill_result_delivered: false,
                 owner_session_id: None,
                 description: None,
+                is_backgrounded: false,
+                output_total_bytes: 0,
             },
             will_wake,
         },
@@ -2133,3 +2188,4 @@ mod background_tasks;
 mod models;
 mod mcp;
 mod git_head;
+mod version_mismatch;

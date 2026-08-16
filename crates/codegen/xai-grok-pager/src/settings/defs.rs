@@ -12,6 +12,7 @@ use crate::appearance::TextSelection;
 use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
 use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -130,16 +131,18 @@ const PERMISSION_MODE_CHOICES: &[EnumChoice] = &[
 // can fail. Commit on Enter only.
 // ---------------------------------------------------------------------------
 
+// The setting's own description carries the full explanation, so the choices
+// are bare labels — an empty description collapses each to a single line.
 const CODING_DATA_SHARING_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "opt-in",
         display: "Opt in",
-        description: "Allow SpaceXAI to retain coding session data for model training and product improvement.",
+        description: "",
     },
     EnumChoice {
         canonical: "opt-out",
         display: "Opt out",
-        description: "Do not retain coding session data for training. Does not disable product analytics.",
+        description: "",
     },
 ];
 
@@ -215,6 +218,21 @@ const PLAN_MODE_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+// Mid-turn follow-up routing. SHARED-owned, persisted to
+// `[ui].follow_up_behavior`. Canonicals match `FollowUpBehavior::as_canonical`.
+const FOLLOW_UP_BEHAVIOR_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "queue",
+        display: "Queue",
+        description: "Hold follow-ups until the current turn finishes.",
+    },
+    EnumChoice {
+        canonical: "steer",
+        display: "Steer",
+        description: "Inject follow-ups mid-turn at the next tool or model step.",
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Mermaid-rendering catalog.
 //
@@ -275,7 +293,7 @@ const TEXT_SELECTION_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: TextSelection::WordSelect.as_canonical(),
         display: "Word select (terminal-like)",
-        description: "Double-click selects & copies a word, triple-click a line; selection stays until dismissed.",
+        description: "Double-click selects & copies a word, triple-click a paragraph; selection stays until dismissed.",
     },
 ];
 
@@ -314,9 +332,10 @@ const SCREEN_MODE_CHOICES: &[EnumChoice] = &[
 ];
 
 // Voice-capture-mode catalog. SHELL-owned, persisted to `[ui].voice_capture_mode`.
-// `hold` is only offered on terminals that report key releases (Kitty keyboard
-// protocol); `effective_enum_choices` hides it elsewhere, and it falls back to
-// `toggle` at runtime.
+// `hold` is gated on `kitty_releases_reported`; `effective_enum_choices` hides it
+// elsewhere, and it falls back to `toggle` at runtime. "Kitty-protocol terminal"
+// in the copy below is a deliberate user-facing simplification: Alacritty <= 0.14
+// negotiates the protocol yet never reports releases, so hold stays hidden there.
 const VOICE_CAPTURE_MODE_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "toggle",
@@ -625,6 +644,46 @@ pub fn default_settings() -> Vec<SettingMeta> {
             keywords: &["queue", "combine", "batch", "follow-up", "merge", "pending"],
             kind: SettingKind::Bool {
                 default: ui_default.combine_queued_prompts.unwrap_or(false),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "follow_up_behavior",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shared,
+            label: "Follow-up behavior",
+            description: "What to do with messages you send while a turn is \
+                          running. Queue waits for the turn to finish; Steer \
+                          injects them mid-turn at the next tool batch or \
+                          model step. Default: Queue.",
+            keywords: &[
+                "queue",
+                "steer",
+                "interject",
+                "follow-up",
+                "followup",
+                "send",
+                "immediate",
+            ],
+            kind: SettingKind::Enum {
+                default: ui_default.follow_up_behavior(),
+                choices: FOLLOW_UP_BEHAVIOR_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "confirm_before_rewind",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shared,
+            label: "Confirm before rewind",
+            description: "Ask before rewinding conversation history. Turn off to rewind \
+                          immediately when you pick a turn.",
+            keywords: &["rewind", "confirm", "undo", "history", "ask", "prompt"],
+            kind: SettingKind::Bool {
+                default: ui_default.confirm_before_rewind_enabled(),
             },
             restart_required: false,
             hidden_in_minimal: false,
@@ -1014,10 +1073,11 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "high", "120", "144",
             ],
             kind: SettingKind::Bool {
+                // Nested Option: None inherits DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED.
                 default: ui_default
                     .display_refresh
                     .auto_cadence_enabled
-                    .unwrap_or(false),
+                    .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
             },
             restart_required: true,
             hidden_in_minimal: true,
@@ -1108,7 +1168,9 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
-        // SHELL-owned `flash` | `hold` on `[ui].keep_text_selection`.
+        // SHELL-owned `flash` | `hold` | `word_select` on `[ui].keep_text_selection`. Compile-time
+        // default `flash`; the default can be set remotely via the `keep_text_selection_default`
+        // soft-default (a staged rollout applied at startup, not in this static default).
         SettingMeta {
             key: "keep_text_selection",
             category: SettingCategory::Mouse,
@@ -1149,10 +1211,11 @@ pub fn default_settings() -> Vec<SettingMeta> {
             key: "coding_data_sharing",
             category: SettingCategory::Privacy,
             owner: SettingOwner::Shell,
-            label: "Coding data sharing",
-            description: "Controls whether SpaceXAI may retain and train on coding session \
-                          data. Does not affect product analytics; see Configuration and \
-                          Monitoring docs.",
+            label: "Coding data, retention, and training",
+            description: "Opt-in to provide SpaceXAI the ability to retain and train on \
+                          coding data, e.g., prompts, traces, & metrics, for training and \
+                          debugging purposes. We may still collect simple user metrics, \
+                          e.g. how many times you use the product or a feature.",
             keywords: &[
                 "privacy",
                 "data",

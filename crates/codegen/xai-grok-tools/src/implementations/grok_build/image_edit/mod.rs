@@ -287,7 +287,7 @@ impl xai_tool_runtime::Tool for ImageEditTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "image_edit",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -461,8 +461,10 @@ mod tests {
     fn tool_name_and_description() {
         let tool = ImageEditTool;
         assert_eq!(xai_tool_runtime::Tool::id(&tool).as_str(), "image_edit");
-        let desc = crate::types::tool_metadata::ToolMetadata::description_template(&tool);
-        assert!(desc.contains("Edit or transform"));
+        assert!(
+            crate::types::tool_metadata::ToolMetadata::description_template(&tool)
+                .contains("Edit or transform")
+        );
     }
 
     #[test]

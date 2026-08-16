@@ -1042,6 +1042,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1167,6 +1168,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("task-completed-abc-123".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1207,6 +1209,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some(pid.to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1244,6 +1247,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1277,6 +1281,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: None,
+                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1990,6 +1995,17 @@
         agent.last_seen_event_id = Some("sess-a-7".into());
         agent.last_applied_event_seq = Some(7);
         agent.last_applied_xai_event_seq = Some(8);
+        agent.deferred_subagent_finishes.insert(
+            "child-stale".into(),
+            crate::app::agent_view::DeferredSubagentFinish {
+                notification: xai_grok_shell::extensions::notification::SessionNotification {
+                    session_id: acp::SessionId::new("sess-a"),
+                    update: test_subagent_finished("child-stale"),
+                    meta: None,
+                },
+                inserted_at: std::time::Instant::now(),
+            },
+        );
 
         let epoch = agent.session_binding_epoch;
         agent.bind_session_id(acp::SessionId::new("sess-a"));
@@ -1997,6 +2013,7 @@
         assert_eq!(agent.last_seen_event_id.as_deref(), Some("sess-a-7"));
         assert_eq!(agent.last_applied_event_seq, Some(7));
         assert_eq!(agent.last_applied_xai_event_seq, Some(8));
+        assert_eq!(agent.deferred_subagent_finishes.len(), 1);
 
         agent.bind_session_id(acp::SessionId::new("sess-b"));
         assert_eq!(agent.session_binding_epoch, epoch.wrapping_add(1));
@@ -2010,6 +2027,10 @@
         );
         assert!(agent.last_applied_event_seq.is_none());
         assert!(agent.last_applied_xai_event_seq.is_none());
+        assert!(
+            agent.deferred_subagent_finishes.is_empty(),
+            "deferred finishes are meaningless against another session"
+        );
     }
 
     #[test]
@@ -2402,7 +2423,10 @@
         let agent = app.agents.get(&AgentId(0)).unwrap();
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::TurnFailed { error, .. }) => {
-                assert_eq!(error, "boom", "agentResult must propagate into the marker")
+                assert_eq!(
+                    error, "Request failed \u{2014} boom. Try sending again.",
+                    "agentResult must propagate into the formatted marker"
+                )
             }
             other => panic!("expected TurnFailed marker, got {other:?}"),
         }
@@ -2526,6 +2550,7 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
+                scheduler_background_loops: None,
             }),
             &mut app,
         );

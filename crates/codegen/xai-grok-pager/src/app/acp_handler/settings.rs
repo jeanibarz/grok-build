@@ -11,38 +11,30 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
             "models updated via x.ai/models/update"
         );
 
-        let shell_fallback_current = new_models.current.clone();
-
-        // Override app-level default with the active agent's model.
-        let mut app_models = new_models.clone();
-        if let ActiveView::Agent(id) = app.active_view
-            && let Some(agent) = app.agents.get(&id)
-            && let Some(ref agent_model) = agent.session.models.current
-            && app_models.available.contains_key(agent_model)
-        {
-            app_models.current = Some(agent_model.clone());
+        app.models.update_catalog(new_models.available.clone());
+        let stale = app
+            .models
+            .current
+            .as_ref()
+            .is_none_or(|id| !app.models.available.contains_key(id));
+        if stale && let Some(id) = new_models.current {
+            app.models.set_current(id, None);
         }
 
-        app.models = app_models;
-
         for agent in app.agents.values_mut() {
-            // Log when an update drops the agent's active model — this is the
-            // moment the status bar visibly "switches model mid-conversation"
-            // (the agent falls back to the shell's current model below).
             if let Some(ref current) = agent.session.models.current
                 && !new_models.available.contains_key(current)
             {
-                tracing::warn!(
+                tracing::debug!(
                     current_model = %current.0,
-                    fallback = ?shell_fallback_current.as_ref().map(|m| m.0.as_ref()),
                     available_count = new_models.available.len(),
-                    "models update removed this agent's current model; falling back"
+                    "models update dropped this session's model from the catalog; keeping it displayed"
                 );
             }
             agent
                 .session
                 .models
-                .update_catalog(new_models.available.clone(), shell_fallback_current.clone());
+                .update_catalog(new_models.available.clone());
         }
         true
     } else {
@@ -57,6 +49,20 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         tracing::warn!("Failed to parse x.ai/settings/update");
         return false;
     };
+
+    // Reseed this process's remote-campaign cache. In leader mode no in-process
+    // agent seeds the TUI process, and the bounded startup prefetch can miss —
+    // without this reseed a remote campaign stays invisible to
+    // `resolve_dismissable_campaigns`, so a `/model` pick never records its
+    // dismissal and the leader re-nudges every new session. Idempotent in
+    // embedded mode, where the in-process agent seeds the same cache.
+    if let Some(campaigns) = update.campaigns.clone() {
+        let rs = xai_grok_shell::util::config::RemoteSettings {
+            campaigns,
+            ..Default::default()
+        };
+        xai_grok_shell::util::config::set_remote_campaigns_from_settings(Some(&rs));
+    }
 
     if let Some(v) = update.auto_permission_mode_enabled {
         // Keep the pager's auto-permission-mode gate live with the remote settings
@@ -107,12 +113,13 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     if let Some(v) = update.show_resolved_model {
         app.show_resolved_model = v;
     }
-    if let Some(v) = update.sharing_enabled {
-        app.sharing_enabled = v;
-        // Propagate to existing agents so slash-command registries stay
-        // in sync (same fan-out pattern used when creating new agents).
+    // Temporary client kill switch: ignore remote `sharing_enabled` until
+    // session share links are restored. Presence is still observed so a
+    // later re-enable can go back to `app.sharing_enabled = v`.
+    if update.sharing_enabled.is_some() {
+        app.sharing_enabled = false;
         for agent in app.agents.values_mut() {
-            agent.set_sharing_enabled(v);
+            agent.set_sharing_enabled(false);
         }
     }
     // Env overrides win over live updates too, mirroring the startup
@@ -138,7 +145,7 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
         let was_api_key = app.is_api_key_auth;
         let is_key = super::super::app_view::is_api_key_label(&v);
         app.is_api_key_auth = is_key;
-        app.usage_visible = !is_key && app.team_name.is_none();
+        app.usage_visible = !is_key && app.team_name.is_none() && !app.has_external_auth_provider;
         app.sync_billing_surface_to_agents();
         app.subscription_tier = Some(v);
         app.apply_tier_restrictions();
@@ -196,6 +203,17 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     //   allow_access=Some(false) without a gate_message must NOT clear the
     //   gate (gate_from_settings returns None when gate_message is absent,
     //   which would incorrectly lift an existing gate).
+
+    // A fresh machine has no auth at startup, so the prefetch never runs and the startup seed sees
+    // no settings. Welcome only: arming behind a session blocks new sessions on an unseen screen.
+    if let Some(gate) = update.consent_gate.as_ref()
+        && matches!(app.consent_state, crate::app::consent::ConsentState::Done)
+        && matches!(app.active_view, crate::app::app_view::ActiveView::Welcome)
+        && app.agents.is_empty()
+    {
+        crate::app::event_loop::seed_consent_state_from_gate(app, Some(gate));
+    }
+
     if update.allow_access == Some(true) {
         let effs = app.lift_gate();
         app.pending_effects.extend(effs);
@@ -289,6 +307,13 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
             }
         }
     }
+
+    // `scheduler_background_loops` is deliberately absent from this handler,
+    // unlike the flags above. A live session's scheduled fires keep the mode
+    // the shell pinned when the session's actor spawned, so applying a pushed
+    // flip here would make `/loop` promise a runtime those fires never get.
+    // The per-session value arrives on the `session/new` / `session/load`
+    // response instead (`AgentView::scheduler_background_loops`).
 
     // Re-resolve tips from config layers + the updated remote tips.
     if let Some(remote_tips) = update.tips {
@@ -523,6 +548,11 @@ pub(super) struct PagerSettingsUpdate {
     // remote_settings also emits gen-ordered `x.ai/announcements/update`
     // (emit_announcements_if_changed), and a gen-less apply on this path could
     // clobber a newer push. Single ingest path: handle_announcements_update.
+    /// Remote campaigns snapshot. `Some` whenever the shell has settings
+    /// (empty = campaigns withdrawn); `None`/omitted (settings-less push,
+    /// older shell) must leave this process's campaign cache untouched.
+    #[serde(default)]
+    campaigns: Option<Vec<xai_grok_shell::util::config::CampaignOverride>>,
     #[serde(default)]
     gate_message: Option<String>,
     #[serde(default)]
@@ -548,6 +578,13 @@ pub(super) struct PagerSettingsUpdate {
     collapsed_edit_blocks: Option<bool>,
     #[serde(default)]
     subscription_watch_interval_secs: Option<u64>,
+    /// Tolerant for the same reason as the settings response it mirrors: a malformed gate must not
+    /// discard the tier, permission mode and campaigns that arrive with it.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_shell::util::config::deserialize_tolerant"
+    )]
+    consent_gate: Option<xai_grok_shell::util::config::ConsentGate>,
 }
 
 /// Presence-aware string: omit → `None` (`#[serde(default)]`), null →
@@ -624,6 +661,21 @@ mod presence_aware_dto_tests {
             some_v.permission_mode,
             Some(Some("always-approve".into())),
             "string must be Some(Some(_))"
+        );
+    }
+
+    #[test]
+    fn malformed_consent_gate_does_not_discard_the_rest_of_the_update() {
+        let update: PagerSettingsUpdate = serde_json::from_value(serde_json::json!({
+            "consent_gate": {"version": "not-a-number"},
+            "tips": ["still applied"],
+        }))
+        .expect("a malformed gate must not fail the whole update");
+
+        assert!(update.consent_gate.is_none());
+        assert_eq!(
+            update.tips.as_deref(),
+            Some(&["still applied".to_string()][..]),
         );
     }
 
