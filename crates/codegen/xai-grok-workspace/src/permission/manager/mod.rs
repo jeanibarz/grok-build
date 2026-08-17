@@ -2363,7 +2363,14 @@ fn spawn_permission_manager_with_pin(
                         );
                         continue;
                     }
-                    {
+                    // YOLO/bypass still reaches this path for bash Ask floors
+                    // (`shell_forced_prompt`). The TUI then auto-selects
+                    // AllowOnce without showing a menu. Firing the hook here
+                    // chimes operator `permission_prompt` hooks on every
+                    // auto-allowed bash tool. Skip notify while manager
+                    // yolo is on — that is the TUI auto-allow case, not a
+                    // real wait.
+                    if !yolo_mode {
                         let slot = user_prompt_notify_actor.lock();
                         if let Some(tx) = slot.as_ref() {
                             let _ = tx.send(());
@@ -3525,6 +3532,115 @@ mod tests {
                     prompts.borrow().len(),
                     uncertain.len(),
                     "ordinary env assignment PolicyDeny must not add prompts"
+                );
+            })
+            .await;
+    }
+
+    /// Same managed bash deny used by `managed_bash_deny_env_split_string_yolo`.
+    /// Uncertain `env -S` then hits `shell_forced_prompt` so YOLO cannot take
+    /// the silent auto-allow and must go through `prompter.request`.
+    fn bash_ask_floor_config() -> crate::permission::types::PermissionConfig {
+        use crate::permission::types::{
+            PatternMode, PermissionConfig, PermissionRule, RuleAction, ToolFilter,
+        };
+        PermissionConfig::new(vec![PermissionRule {
+            action: RuleAction::Deny,
+            tool: ToolFilter::Bash,
+            pattern: Some("rm*".to_owned()),
+            pattern_mode: PatternMode::Glob,
+        }])
+    }
+
+    /// YOLO still reaches `prompter.request` for bash Ask floors
+    /// (`shell_forced_prompt`). The TUI then auto-selects AllowOnce without
+    /// showing a menu. Firing `user_prompt_notify` there chimes operator
+    /// `permission_prompt` hooks on every auto-allowed bash tool.
+    #[tokio::test]
+    async fn yolo_bash_ask_floor_does_not_notify_permission_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, mut ev) = manager_with_recording_client_remember(
+                    &cwd,
+                    Some(bash_ask_floor_config()),
+                    SelectingClient::new(true),
+                    ClientType::Generic,
+                    true,
+                );
+                mgr.set_yolo_mode(true);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                mgr.set_user_prompt_notify(tx);
+
+                let d = mgr
+                    .request(
+                        AccessKind::Bash("env -S 'echo $HOME'".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(d, Decision::Allow),
+                    "TUI-style AllowOnce on a bash Ask floor must still allow, got {d:?}"
+                );
+                let event = ev.try_recv().expect("decision event");
+                assert!(
+                    event.user_prompted,
+                    "YOLO must still prompt on a bash Ask floor (not the silent auto-allow), reason={:?}",
+                    event.decision_reason
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "yolo bash Ask floor must not fire user_prompt_notify"
+                );
+            })
+            .await;
+    }
+
+    /// Control: the same Ask floor with YOLO off still notifies.
+    #[tokio::test]
+    async fn non_yolo_bash_ask_floor_notifies_permission_prompt() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let (mgr, mut ev) = manager_with_recording_client_remember(
+                    &cwd,
+                    Some(bash_ask_floor_config()),
+                    SelectingClient::new(true),
+                    ClientType::Generic,
+                    true,
+                );
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                mgr.set_user_prompt_notify(tx);
+
+                let d = mgr
+                    .request(
+                        AccessKind::Bash("env -S 'echo $HOME'".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(d, Decision::Allow),
+                    "AllowOnce on a bash Ask floor must allow, got {d:?}"
+                );
+                let event = ev.try_recv().expect("decision event");
+                assert!(
+                    event.user_prompted,
+                    "non-yolo bash Ask floor must prompt, reason={:?}",
+                    event.decision_reason
+                );
+                assert!(
+                    rx.try_recv().is_ok(),
+                    "a real (non-yolo) bash Ask floor must fire user_prompt_notify"
                 );
             })
             .await;
