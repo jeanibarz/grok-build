@@ -1113,7 +1113,7 @@ fn subagents_config_parses_max_depth_from_toml() {
     without_grok_subagents(|| {
         let config: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n")
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(Some(false), &config);
         assert_eq!(sa.max_depth, Some(2));
     });
 }
@@ -1156,7 +1156,7 @@ fn subagents_config_parses_limits_from_toml() {
                 "[subagents]\nmax_concurrent = 4\nlimit_behavior = \"fail\"\nworkflow_max_concurrent = 8\n",
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(Some(false), &config);
         assert_eq!(sa.max_concurrent, Some(4));
         assert_eq!(sa.limit_behavior.as_deref(), Some("fail"));
         assert_eq!(sa.workflow_max_concurrent, Some(8));
@@ -1169,7 +1169,7 @@ fn subagents_config_parses_negative_max_depth_without_dropping_section() {
                 "[subagents]\nenabled = true\nmax_depth = -1\n",
             )
             .unwrap();
-        let sa = SubagentsConfig::resolve(false, &config);
+        let sa = SubagentsConfig::resolve(Some(false), &config);
         assert!(sa.enabled);
         assert_eq!(sa.max_depth, Some(-1));
         assert_eq!(
