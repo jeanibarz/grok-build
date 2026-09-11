@@ -228,7 +228,6 @@ impl SessionActor {
                 tool_input_truncated,
             },
             None,
-            Some(tool_name),
         )
         .await;
         Ok(blocked)
