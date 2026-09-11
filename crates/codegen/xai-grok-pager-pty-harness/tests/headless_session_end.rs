@@ -110,7 +110,7 @@ enabled = false
         result.stdout
     );
     assert_eq!(
-        std::fs::read_to_string(marker).expect("SessionEnd hook must run"),
+        std::fs::read_to_string(&marker).expect("SessionEnd hook must run"),
         "done"
     );
 }
