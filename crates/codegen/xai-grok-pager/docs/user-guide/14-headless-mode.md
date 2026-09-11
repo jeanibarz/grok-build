@@ -670,8 +670,8 @@ These flags supplement the [Command-Line Options](#command-line-options) table a
 | `--disable-web-search`        | Disable web search and fetch tools                |
 | `--alt-screen`                | Force alternate screen (fullscreen buffer; overrides config/auto) |
 | `--no-alt-screen`             | Run inline (no alternate screen; overrides config/auto) |
-| `--worktree [NAME]`           | Start session in a new git worktree               |
-| `--ref <REF>` / `--worktree-ref <REF>` | Branch/tag/commit to base the worktree on (with `--worktree`) |
+| `--worktree [NAME]`           | Create a git worktree from the current checkout (dirty changes included) and run the session there. Launching from a subdirectory lands in the same subdirectory of the worktree. With `-r`, the session is resumed into the new worktree. Not combinable with `--fork-session`. |
+| `--ref <REF>` / `--worktree-ref <REF>` | Branch/tag/commit to base the worktree on (with `--worktree`); a clean checkout, no dirty overlay |
 
 ---
 
